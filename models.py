@@ -60,6 +60,7 @@ class SSMDecoder(nn.Module):
         # 1) FC layers reversed
         self.fc3 = nn.Linear(latent_dim, 512)          # turns 32#s into 512#s
         self.fc2 = nn.Linear(512, 1024)                # turns 512#s into 1024#s
+        self.skip_h3 = nn.Linear(512, 1024, bias=False) # << projection for skip
         self.fc1 = nn.Linear(1024, base_channels * 8)  # match encoder conv final ch
         # 2) 8 upsampling deconv layers
         deconv_layers = []                             
@@ -77,9 +78,9 @@ class SSMDecoder(nn.Module):
 
     def forward(self, z):
         # FC reverse stack + skip
-        h3 = F.relu(self.fc3(z))            # (B,512)        #first output of fc layer -> relu
-        h2 = F.relu(self.fc2(h3) + h3)      # skip           #mixes again but also adds back the old h3
-        h1 = F.relu(self.fc1(h2))           # (B, base*8)    #mixes down to final 512 numbers
+        h3 = F.relu(self.fc3(z))                    # (B,512)        #first output of fc layer -> relu
+        h2 = F.relu(self.fc2(h3) + self.skip_h3(h3))# skip           #mixes again but also adds back the old h3
+        h1 = F.relu(self.fc1(h2))                   # (B, base*8)    #mixes down to final 512 numbers
         # reshape to feature map for deconv
         x = h1.view(h1.size(0), -1, 1, 1)   # (B,base*8,1,1) #jump from 512 numbers to a 512x1x1 little map
         return self.deconv(x)               # (B,1,256,256)  #let self.deconv blow it up 8 times
