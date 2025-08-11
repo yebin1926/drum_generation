@@ -1,0 +1,15 @@
+FROM pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
+
+# System deps for audio I/O and rendering
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fluidsynth libsndfile1 ffmpeg git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+      librosa pandas numpy scipy matplotlib \
+      soundfile pretty_midi midiutil \
+      pypianoroll==0.4.2 opencv-python
+
+WORKDIR /workspace
