@@ -133,14 +133,26 @@ def load_multitrack(npz_path: Path) -> ppr.Multitrack:
 
 def normalize_tempo_to_120(multitrack: ppr.Multitrack):
     """Set tempo array to 120 QPM uniformly (§3.1)."""
-    T = multitrack.get_max_length()
+    T = multitrack_max_length_steps(multitrack)
     multitrack.tempo = np.full((T, 1), TEMPO_QPM, dtype=float)
     return multitrack
 
+def multitrack_max_length_steps(mt):
+    L = 0
+    for tr in mt.tracks:
+        if tr.pianoroll is not None:
+            L = max(L, tr.pianoroll.shape[0])
+    return L
+
 def get_downbeat_indices(multitrack: ppr.Multitrack):
     """Indices where downbeat is True/1 (start of each bar in LPD)."""
-    db = multitrack.downbeat.squeeze() #flag per timestep - (1 at the start of every bar, 0 elsewhere). squeexe it to 1D
-    return np.where(db > 0)[0].tolist()
+    # db = multitrack.downbeat.squeeze() #flag per timestep - (1 at the start of every bar, 0 elsewhere). squeexe it to 1D
+    # return np.where(db > 0)[0].tolist()
+    db = multitrack.downbeat
+    if db.ndim == 2:        # (T,1) -> (T,)
+        db = db.squeeze(1)
+    db = db.astype(bool)
+    return np.where(db)[0].tolist()
 
 def steps_to_seconds(indices, resolution: int, tempo_qpm=TEMPO_QPM):
     """Convert time-step indices to seconds given resolution and tempo (qpm)."""
@@ -154,17 +166,256 @@ def slice_bars(track_roll: np.ndarray, bar_edges_steps: list, steps_per_bar=BAR_
     for b in range(len(bar_edges_steps) - 1):
         start, end = bar_edges_steps[b], bar_edges_steps[b+1]
         # as LPD uses symbolic time, each bar should be 4*resolution steps; res * 4 == 96 default
-        bar = track_roll[start:end, :].T  # (steps, 128) -> transpose later to (128, steps)
-        # Ensure exact width (trim/pad)
-        if bar.shape[0] != (BAR_STEPS):
-            # If not exact (rare), resample by simple pad/trim to BAR_STEPS
-            if bar.shape[0] > BAR_STEPS:
-                bar = bar[:BAR_STEPS, :]
-            else:
-                pad = np.zeros((BAR_STEPS - bar.shape[0], bar.shape[1]), dtype=bar.dtype)
-                bar = np.concatenate([bar, pad], axis=0)
-        bars.append(bar.T)  # (128, BAR_STEPS)
+        bar = track_roll[start:end, :]  # (steps, 128) -> transpose later to (128, steps)
+    #     # Ensure exact width (trim/pad)
+    #     if bar.shape[0] != (BAR_STEPS):
+    #         # If not exact (rare), resample by simple pad/trim to BAR_STEPS
+    #         if bar.shape[0] > steps_per_bar:
+    #             bar = bar[:BAR_STEPS, :]
+    #         else:
+    #             pad = np.zeros((BAR_STEPS - bar.shape[0], bar.shape[1]), dtype=bar.dtype)
+    #             bar = np.concatenate([bar, pad], axis=0)
+    #     bars.append(bar.T)  # (128, BAR_STEPS)
+    # return bars
+        if bar.shape[0] > steps_per_bar:
+            bar = bar[:steps_per_bar, :]
+        elif bar.shape[0] < steps_per_bar:
+            pad = np.zeros((steps_per_bar - bar.shape[0], bar.shape[1]), dtype=bar.dtype)
+            bar = np.concatenate([bar, pad], axis=0)
+
+        bars.append(bar.T)                           # (128, steps_per_bar)
     return bars
+
+# -------------------------
+# Computing Downbeats
+# -------------------------
+
+# --- deps ---
+import numpy as np
+import copy
+from typing import List, Tuple, Dict, Optional
+
+import pypianoroll as ppr
+import pretty_midi as pm
+
+
+# ============== I/O helpers ==============
+def load_pretty_midi_from_npz(npz_path) -> pm.PrettyMIDI:
+    """LPD NPZ -> pypianoroll.Multitrack -> PrettyMIDI."""
+    mt = ppr.load(str(npz_path))                 # LPD NPZ
+    return mt.to_pretty_midi()                   # identical to what the paper did
+
+
+def load_pretty_midi_from_midi(midi_path) -> pm.PrettyMIDI:
+    return pm.PrettyMIDI(str(midi_path))
+
+
+# ============== bar grid (raw) ==============
+def get_beats(pmidi: pm.PrettyMIDI) -> np.ndarray:
+    """Return beat times (seconds) as a 1-D float array."""
+    beats = pmidi.get_beats()        # works even if time-signatures are missing
+    return np.asarray(beats, dtype=float)
+
+
+def get_downbeats_raw(pmidi: pm.PrettyMIDI) -> List[float]:
+    """
+    Try pretty_midi.get_downbeats(); if empty/degenerate, synthesize
+    downbeats from beats and a time-signature guess (default 4/4).
+    """
+    db = pmidi.get_downbeats()
+    if len(db) >= 2:
+        return db.tolist()
+
+    # Fallback: derive from beats every 'numerator' beats (default 4)
+    # If you have real TS, you can parse pmidi.time_signature_changes; most LPD files lack it.
+    beats = get_beats(pmidi)
+    if beats.size < 2:
+        return []   # hopeless case; the file is broken
+
+    numerator = _guess_numerator(pmidi)          # default 4
+    idx = np.arange(0, beats.size, numerator, dtype=int)
+    return beats[idx].tolist()
+
+
+def _guess_numerator(pmidi: pm.PrettyMIDI, default_num: int = 4) -> int:
+    """Return likely TS numerator; use first/most-common if present; else default 4."""
+    ts = pmidi.time_signature_changes
+    if len(ts) > 0:
+        nums = [t.numerator for t in ts]
+        vals, counts = np.unique(nums, return_counts=True)
+        return int(vals[np.argmax(counts)])
+    return default_num
+
+
+# ============== downbeat correction (paper’s note-density shift) ==============
+def fix_downbeats_by_note_density(pmidi: pm.PrettyMIDI,
+                                  downbeats_list: List[float],
+                                  bar_portion: int = 96) -> Dict[str, np.ndarray]:
+    """
+    Implements the logic you posted from step_1:
+    - make a +- (half basic unit) window around each downbeat
+    - count note onsets falling in [standard, +1 unit, -1 unit] windows
+    - shift the downbeat by +1/-1 unit if more notes fall there than in standard
+    Returns dict with keys:
+      - downbeats_fixed (np.ndarray)
+      - basic_time_unit (float)
+      - counts (dict of arrays for debugging)
+    """
+    if len(downbeats_list) < 2:
+        return {
+            "downbeats_fixed": np.asarray(downbeats_list, dtype=float),
+            "basic_time_unit": 0.0,
+            "counts": {}
+        }
+
+    # Basic unit = average bar period / 96
+    db = np.asarray(downbeats_list, dtype=float)
+    bar_periods = db[1:] - db[:-1]
+    bar_period_avg = float(np.mean(bar_periods))
+    basic_time_unit = bar_period_avg / float(bar_portion)
+
+    # Construct per-bar windows centered at each downbeat ± 0.5 unit
+    downbeats_range = np.vstack([db - 0.5*basic_time_unit,
+                                 db + 0.5*basic_time_unit])
+    downbeats_range[downbeats_range < 0.0] = 0.0
+    n_bars = db.shape[0]
+
+    # Three counters per bar: [standard], [shift+1], [shift-1]
+    cnt_std = np.zeros(n_bars, dtype=int)
+    cnt_p1  = np.zeros(n_bars, dtype=int)
+    cnt_n1  = np.zeros(n_bars, dtype=int)
+
+    # Iterate all note onsets in the piece
+    # (paper used all tracks; you can restrict to non-drum if desired)
+    for inst in pmidi.instruments:
+        for note in inst.notes:
+            onset = float(note.start)
+
+            # standard window
+            hit = _accum_if_in_ranges(onset, downbeats_range, cnt_std)
+            if hit:
+                continue
+
+            # +1 unit
+            rng_p1 = downbeats_range + basic_time_unit
+            hit = _accum_if_in_ranges(onset, rng_p1, cnt_p1)
+            if hit:
+                continue
+
+            # -1 unit
+            rng_n1 = downbeats_range - basic_time_unit
+            _accum_if_in_ranges(onset, rng_n1, cnt_n1)
+
+    # Decide shifts: +1 if cnt_p1 > cnt_std; -1 if cnt_n1 > cnt_std
+    shift = np.zeros(n_bars, dtype=int)
+    for i in range(n_bars):
+        if max(cnt_p1[i], cnt_n1[i]) > cnt_std[i]:
+            shift[i] = 1 if cnt_p1[i] > cnt_n1[i] else -1
+
+    downbeats_fixed = db + shift.astype(float) * basic_time_unit
+    downbeats_fixed[downbeats_fixed < 0.0] = 0.0
+
+    return {
+        "downbeats_fixed": downbeats_fixed,
+        "basic_time_unit": basic_time_unit,
+        "counts": {"std": cnt_std, "+1": cnt_p1, "-1": cnt_n1, "shift": shift}
+    }
+
+
+def _accum_if_in_ranges(onset: float, ranges: np.ndarray, counter: np.ndarray) -> bool:
+    """
+    ranges: shape (2, n_bars) [[start_i], [end_i]]
+    counter: shape (n_bars,)
+    If onset in any [start_i, end_i), increment that bar's counter and return True.
+    """
+    starts = ranges[0]; ends = ranges[1]
+    # vectorized test; most efficient: look for first match
+    mask = (onset >= starts) & (onset < ends)
+    if mask.any():
+        i = int(np.argmax(mask))   # first True
+        counter[i] += 1
+        return True
+    return False
+
+
+# ============== bar windows (centered; paper’s half-unit shift) ==============
+def build_bar_ranges(downbeats_fixed: np.ndarray, bar_portion: int = 96) -> List[Tuple[float, float]]:
+    """
+    Given fixed downbeats (seconds), build [start,end] for each bar:
+      [db_i - half_unit, db_{i+1} - half_unit], clipped at 0
+    """
+    db = np.asarray(downbeats_fixed, dtype=float)
+    out = []
+    for i in range(len(db) - 1):
+        bar_len = db[i+1] - db[i]
+        half = (bar_len / float(bar_portion)) * 0.5
+        start = max(db[i]   - half, 0.0)
+        end   = max(db[i+1] - half, 0.0)
+        out.append((start, end))
+    return out
+
+
+# ============== full wrapper ==============
+def compute_downbeats_for_song(
+    source_path,
+    kind: str = "npz",      # "npz" (LPD) or "midi"
+    bar_portion: int = 96
+) -> Dict[str, object]:
+    """
+    End-to-end:
+      - load PrettyMIDI
+      - get raw downbeats (or synthesize from beats)
+      - apply note-density correction (± one 96th)
+      - produce centered bar ranges
+    Returns:
+      {
+        "downbeats_raw": list[float],
+        "downbeats_fixed": np.ndarray,
+        "basic_time_unit": float,
+        "bar_ranges": list[(start,end)],
+        "tempo_bpm": float
+      }
+    """
+    pmidi = (load_pretty_midi_from_npz(source_path)
+             if kind == "npz" else
+             load_pretty_midi_from_midi(source_path))
+
+    # raw (or synthesized) downbeats
+    db_raw = get_downbeats_raw(pmidi)
+
+    # safety: if still <2, abort early
+    if len(db_raw) < 2:
+        return {
+            "downbeats_raw": db_raw,
+            "downbeats_fixed": np.asarray(db_raw, dtype=float),
+            "basic_time_unit": 0.0,
+            "bar_ranges": [],
+            "tempo_bpm": estimate_global_tempo(pmidi)
+        }
+
+    # note-density based shift
+    fix = fix_downbeats_by_note_density(pmidi, db_raw, bar_portion=bar_portion)
+    db_fixed = fix["downbeats_fixed"]
+
+    # centered windows
+    bars = build_bar_ranges(db_fixed, bar_portion=bar_portion)
+
+    return {
+        "downbeats_raw": db_raw,
+        "downbeats_fixed": db_fixed,
+        "basic_time_unit": float(fix["basic_time_unit"]),
+        "bar_ranges": bars,
+        "tempo_bpm": estimate_global_tempo(pmidi)
+    }
+
+
+def estimate_global_tempo(pmidi: pm.PrettyMIDI) -> float:
+    """Simple: mean beat period → BPM."""
+    beats = get_beats(pmidi)
+    if beats.size < 2:
+        return 120.0
+    periods = np.diff(beats)
+    return float(np.round(60.0 / np.mean(periods), 2))
 
 
 # -------------------------
@@ -184,7 +435,102 @@ def prepare_one_song(npz_path: Path):
     - Save both padded to 256 x 256
     """
     mt = load_multitrack(npz_path) #lturn NPZ into Multitrack
-    resolution = int(mt.resolution)     # steps per quarter (LPD default 24 fits 96 per bar)  :contentReference[oaicite:4]{index=4}
+
+    # --- checking start ---
+    print(f"\n[dbg] === {npz_path.name} ===")
+    # 1) Which resolution attribute exists?
+    res_attr = "beat_resolution" if hasattr(mt, "beat_resolution") else (
+            "resolution"      if hasattr(mt, "resolution")      else None)
+    print(f"[dbg] res_attr={res_attr}  value={getattr(mt, res_attr, None)}")
+    assert res_attr is not None, "Multitrack has neither beat_resolution nor resolution."
+
+    resolution = int(getattr(mt, res_attr))
+    steps_per_bar = resolution * 4
+    print(f"[dbg] steps_per_quarter={resolution}  steps_per_bar={steps_per_bar}")
+    if steps_per_bar != 96:
+        print(f"[warn] steps_per_bar={steps_per_bar} != 96 (paper uses 96). "
+            f"Your slice_bars() will pad/trim per bar.")
+
+    # 2) Basic timeline length
+    T = max((tr.pianoroll.shape[0] for tr in mt.tracks if tr.pianoroll is not None), default=0)
+    print(f"[dbg] T (max time steps across tracks) = {T}")
+
+    # 3) Downbeat & tempo arrays
+    # Delete: wrong downbeat calculation
+    # db = mt.downbeat
+    # print(f"[dbg] downbeat.shape={db.shape}")
+    # db = db.squeeze()  # (T,1)->(T,)
+    # assert db.ndim == 1, "downbeat should be 1-D after squeeze."
+    # assert db.shape[0] == T, f"downbeat length {db.shape[0]} != T {T}"
+
+    ## Fixed downbeat calculation
+    pmidi = mt.to_pretty_midi()
+
+    # 3a) get raw downbeats (or synthesize from beats if missing), then fix by note density
+    downbeats_raw_sec = get_downbeats_raw(pmidi)
+    if len(downbeats_raw_sec) < 2:
+        print("[warn] not enough downbeats; skipping song.")
+        return None
+
+    fix = fix_downbeats_by_note_density(pmidi, downbeats_raw_sec, bar_portion=BAR_STEPS)
+    downbeats_sec = fix["downbeats_fixed"]                  # seconds
+    if downbeats_sec.size < 2:
+        print("[warn] fixed downbeats too few; skipping song.")
+        return None
+
+    # 3b) convert those seconds to step indices (because your drum pianoroll is in steps)
+    sec_per_quarter = 60.0 / TEMPO_QPM                      # normalized tempo
+    sec_per_step    = sec_per_quarter / resolution          # e.g., 0.5/24 ≈ 0.020833 s
+    bar_edges_steps = np.clip(
+        np.round(downbeats_sec / sec_per_step).astype(int),
+        0, max(0, T-1)
+    ).tolist()
+
+    # 3c) synthesize a 1-D downbeat vector 'db' of length T (for legacy code that expects it)
+    db = np.zeros(T, dtype=np.uint8)
+    if len(bar_edges_steps) > 0:
+        db[np.array(bar_edges_steps, dtype=int)] = 1
+
+    # (Optional) keep mt.downbeat consistent for any later code that still reads it
+    # shape should be (T,1) in pypianoroll
+    mt.downbeat = db[:, None]
+
+    # 3d) debug info similar to your old prints
+    print(f"[dbg] synthesized db.shape={db.shape}, #ones={int(db.sum())}, first8_idxs={bar_edges_steps[:8]}")
+    print(f"[dbg] basic_time_unit={fix['basic_time_unit']:.6f}s, est_tempo≈{estimate_global_tempo(pmidi):.2f} bpm")
+    print("downbeats (steps) =", len(bar_edges_steps))
+
+    # Also keep the seconds-based edges for your audio CQT pooling later:
+    bar_edges_sec = downbeats_sec.tolist()
+
+    ## end: end of fix
+
+    db_idx = np.where(db > 0)[0]
+    print(f"[dbg] #downbeats={len(db_idx)}  first8={db_idx[:8]}")
+
+    tempo = getattr(mt, "tempo", None)
+    if tempo is not None:
+        print(f"[dbg] tempo.shape={tempo.shape}  example first3={tempo[:3].ravel() if len(tempo)>0 else tempo}")
+    else:
+        print("[dbg] tempo not present on this Multitrack (ok; we normalize later).")
+
+    # 4) Drum track present?
+    drum_idx = next((i for i,tr in enumerate(mt.tracks) if getattr(tr, "is_drum", False)), None)
+    print(f"[dbg] drum_idx={drum_idx}")
+    assert drum_idx is not None, "No drum track found (this song will be skipped)."
+
+    drum_roll = mt.tracks[drum_idx].pianoroll
+    print(f"[dbg] drum pianoroll shape={None if drum_roll is None else drum_roll.shape}")
+
+    # 5) Quick per-bar width check using your get_downbeat_indices()
+    bar_edges_steps = [i for i in range(len(db)) if db[i]]
+    print(f"[dbg] bars (by downbeats) = {len(bar_edges_steps)-1 if len(bar_edges_steps)>1 else 0}")
+    if len(bar_edges_steps) >= 2:
+        w0 = bar_edges_steps[1] - bar_edges_steps[0]
+        print(f"[dbg] first bar width in steps = {w0}  (expected ~ {steps_per_bar})")
+    # --- checking end ---
+
+    resolution = int(mt.beat_resolution)      # steps per quarter (LPD default 24 fits 96 per bar)  :contentReference[oaicite:4]{index=4}
 
     # LPD-5 has 5 merged tracks: Drums, Piano, Guitar, Bass, Strings  :contentReference[oaicite:5]{index=5}
     # Find drum track index via is_drum
@@ -199,11 +545,35 @@ def prepare_one_song(npz_path: Path):
     # Normalize tempo to 120 QPM so bar timing is consistent in audio (§3.1)
     mt = normalize_tempo_to_120(mt)
 
-    # Downbeat indices (bar edges) at symbolic steps, then seconds
-    bar_edges_steps = get_downbeat_indices(mt) #find where each bar starts as list
-    if len(bar_edges_steps) < 2:
+    # delete : wrong downbeat computation
+    # # Downbeat indices (bar edges) at symbolic steps, then seconds
+    # bar_edges_steps = get_downbeat_indices(mt) #find where each bar starts as list
+    # if len(bar_edges_steps) < 2:
+    #     return None
+    # bar_edges_sec = steps_to_seconds(bar_edges_steps, resolution, TEMPO_QPM) #convert downbeat steps -> seconds
+
+    ## --- Compute downbeats from PrettyMIDI (robust), then correct by note density ---
+    # Important: do this AFTER normalize_tempo_to_120 so pmidi aligns with 120 QPM
+    pmidi = mt.to_pretty_midi()
+
+    downbeats_raw_sec = get_downbeats_raw(pmidi)                # either true downbeats or synthesized from beats
+    if len(downbeats_raw_sec) < 2:
+        return None  # still unusable
+
+    fix = fix_downbeats_by_note_density(pmidi, downbeats_raw_sec, bar_portion=BAR_STEPS)
+    downbeats_sec = fix["downbeats_fixed"].tolist()
+    if len(downbeats_sec) < 2:
         return None
-    bar_edges_sec = steps_to_seconds(bar_edges_steps, resolution, TEMPO_QPM) #convert downbeat steps -> seconds
+
+    # Keep seconds-based edges for audio CQT pooling
+    bar_edges_sec = downbeats_sec
+
+    # Also convert these seconds to step indices for slicing the symbolic drum pianoroll
+    # Because we normalized tempo to constant 120 QPM, step duration is fixed:
+    sec_per_quarter = 60.0 / TEMPO_QPM                 # 0.5 s at 120 QPM
+    sec_per_step    = sec_per_quarter / resolution     # e.g., 0.5 / 24 ≈ 0.020833 s/step
+    bar_edges_steps = [int(round(t / sec_per_step)) for t in downbeats_sec]
+    ## end: end of downbeat calculation
 
     # Write three MIDI variants
     stem = npz_path.stem
@@ -308,7 +678,6 @@ def prepare_one_song(npz_path: Path):
         "bars": len(drum_bars)
     }
 
-
 def prepare_dataset(limit=None):
     #create output folders
     OUT_MIDI_ALL.mkdir(parents=True, exist_ok=True)
@@ -319,8 +688,24 @@ def prepare_dataset(limit=None):
     OUT_MEL_SSM.mkdir(parents=True, exist_ok=True)
     OUT_DRUM_SSM.mkdir(parents=True, exist_ok=True)
 
+    # print("[dbg] first_10_npz =", list_npz_files(DATASET_ROOT)[:10]) #checking: list firrst few npz files found under DATASET_ROOT & print total count
     #finds all npz files
     npz_files = list_npz_files(DATASET_ROOT)
+
+    # # --- checking start ---
+    # print("[dbg] DATASET_ROOT:", DATASET_ROOT.resolve(), "exists:", DATASET_ROOT.exists())
+    # print("[dbg] total *.npz found:", len(npz_files))
+    # print("[dbg] first 5:", [str(p) for p in npz_files[:5]])
+
+    # # show sizes of first few
+    # for p in npz_files[:5]:
+    #     try:
+    #         sz = p.stat().st_size
+    #         print(f"[dbg] {p.name} -> {sz/1e6:.2f} MB")
+    #     except Exception as e:
+    #         print(f"[dbg] stat failed for {p}: {e}")
+    # # --- checking end ---
+
     if limit is not None: #if there is limit on range of npz files, apply it
         npz_files = npz_files[:limit]
 
@@ -376,12 +761,50 @@ bce = nn.BCEWithLogitsLoss()
 
 
 def train_ssm(limit=None):
+    # print("[dbg] mel_pkls =", sum(1 for _ in OUT_MEL_SSM.glob("*.pkl")))    #checking: how many precomputed pickles (melodic SSMs) you alr have
+    # print("[dbg] drm_pkls =", sum(1 for _ in OUT_DRUM_SSM.glob("*.pkl")))   #checking: how many precomputed pickles (drum SSMs) you alr have
     # If no SSMs yet, run preparation first
+
     #check if preprocessed melodic/drum SSM pickles exist. If not, call prepare_dataset()
     if len(list(OUT_MEL_SSM.glob("*.pkl"))) == 0 or len(list(OUT_DRUM_SSM.glob("*.pkl"))) == 0:
         print("[info] No SSMs detected — preparing dataset from LPD via Pypianoroll...")
         # prepare_dataset(limit=None)
         prepare_dataset(limit=limit) # delete
+    
+    # checking begin
+    # --- preflight: what’s on disk? ---
+    print("[dbg] MEL dir:", OUT_MEL_SSM.resolve(), "exists:", OUT_MEL_SSM.exists())
+    print("[dbg] DRM dir:", OUT_DRUM_SSM.resolve(), "exists:", OUT_DRUM_SSM.exists())
+
+    mel_files  = sorted(OUT_MEL_SSM.glob("song_barlv_ssm_*.pkl"))
+    drum_files = sorted(OUT_DRUM_SSM.glob("song_barlv_drum_ssm_*.pkl"))
+    print("[dbg] #mel_pkls:", len(mel_files), "  #drum_pkls:", len(drum_files))
+    print("[dbg] mel examples:", [p.name for p in mel_files[:5]])
+    print("[dbg] drm examples:", [p.name for p in drum_files[:5]])
+
+    # stem matching
+    mel_stems  = {p.stem.replace("song_barlv_ssm_", "") for p in mel_files}
+    drum_stems = {p.stem.replace("song_barlv_drum_ssm_", "") for p in drum_files}
+    common     = sorted(mel_stems & drum_stems)
+    only_mel   = sorted(mel_stems - drum_stems)
+    only_drum  = sorted(drum_stems - mel_stems)
+    print("[dbg] #matched stems:", len(common))
+    print("[dbg] first matched stem:", (common[0] if common else None))
+    print("[dbg] mel-without-drum (up to 5):", only_mel[:5])
+    print("[dbg] drum-without-mel (up to 5):", only_drum[:5])
+
+    # try loading one matched pair
+    if common:
+        stem = common[0]
+        import pickle, numpy as np, os
+        mpath = OUT_MEL_SSM  / f"song_barlv_ssm_{stem}.pkl"
+        dpath = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{stem}.pkl"
+        with open(mpath, "rb") as f: mel = pickle.load(f)
+        with open(dpath, "rb") as f: drm = pickle.load(f)
+        mel = np.asarray(mel); drm = np.asarray(drm)
+        print("[dbg] mel shape:", mel.shape, "range:", (mel.min(), mel.max()))
+        print("[dbg] drm shape:", drm.shape, "range:", (drm.min(), drm.max()))
+    # checking end
 
     dataset = SSMTrainDataset(OUT_MEL_SSM, OUT_DRUM_SSM) #instantiate SSM Train Datatset
     assert len(dataset) > 0, "No paired SSM samples found."
@@ -494,21 +917,37 @@ if __name__ == "__main__":
     import argparse, os
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=None, help="limit #songs to prepare")
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--dataset_root", type=str, default=None)
-    ap.add_argument("--device", type=str, default=None, help="cuda or cpu")
+    ap.add_argument("--epochs", type=int, default=None, help="override NUM_EPOCHS")
+    ap.add_argument("--batch_size", type=int, default=None, help="override BATCH_SIZE")
+    ap.add_argument("--dataset_root", type=str, default=None, help="override DATASET_ROOT")
+    ap.add_argument("--device", type=str, default=None, help="'cuda' or 'cpu'")
+
+    # NEW: hyperparams for optimizers
+    ap.add_argument("--lrG", type=float, default=None, help="Adam LR for generator (VAE)")
+    ap.add_argument("--lrD", type=float, default=None, help="Adam LR for discriminator")
+    ap.add_argument("--beta1", type=float, default=None, help="Adam beta1")
+    ap.add_argument("--beta2", type=float, default=None, help="Adam beta2")
     args = ap.parse_args()
 
-    # override globals if provided
+    # Override globals if flags provided
     if args.dataset_root:
         DATASET_ROOT = Path(args.dataset_root)
-    if args.epochs:
+    if args.epochs is not None:
         NUM_EPOCHS = args.epochs
-    if args.batch_size:
+    if args.batch_size is not None:
         BATCH_SIZE = args.batch_size
     if args.device:
         DEVICE = torch.device(args.device)
+
+    if args.lrG is not None:
+        LR_GEN = args.lrG
+    if args.lrD is not None:
+        LR_DIS = args.lrD
+    if args.beta1 is not None:
+        BETA1 = args.beta1
+    if args.beta2 is not None:
+        BETA2 = args.beta2
+
 
     # pass limit into prepare if needed
     # quick hack: set an env that prepare_dataset() can read
