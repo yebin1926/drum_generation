@@ -123,8 +123,9 @@ class SSMDiscriminator(nn.Module):
         self.conv = nn.Sequential(*layers)          #stash all 8 blocks into one nn.Sequential
         self.classifier = nn.Sequential(
             nn.Flatten(),                           #turns (B, 512, 1, 1) -> (B, 512)
-            nn.Linear(curr_ch, 1),                  #maps features to single logit
-            nn.Sigmoid()                            #squash into [0,1] -> "prob this SSM is real"
+            nn.Linear(curr_ch, 1)                  #maps features to single logit
+            #nn.Sigmoid()                            #squash into [0,1] -> "prob this SSM is real"
+
         )
 
     def forward(self, x):

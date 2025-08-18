@@ -48,8 +48,10 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
 NUM_EPOCHS = 50
-LR_GEN = 2e-4
-LR_DIS = 2e-4
+# LR_GEN = 2e-4
+# LR_DIS = 2e-4
+LR_GEN = 1e-4
+LR_DIS = 1e-4
 BETA1, BETA2 = 0.5, 0.999
 LAMBDA_REC = 1.0
 LAMBDA_KL  = 1.0
@@ -126,7 +128,8 @@ def pairwise_euclidean_bar_ssm(bar_mats: np.ndarray):
 # LPD NPZ -> pypianoroll.Multitrack (recommended I/O format)  :contentReference[oaicite:3]{index=3}
 
 def load_multitrack(npz_path: Path) -> ppr.Multitrack:
-    return ppr.load(npz_path)  # supports LPD NPZ format
+    # return ppr.load(npz_path)  # supports LPD NPZ format
+    return ppr.load(str(npz_path)) #changed
 
 def normalize_tempo_to_120(multitrack: ppr.Multitrack):
     """Set tempo array to 120 QPM uniformly (§3.1)."""
@@ -368,14 +371,17 @@ class SSMTrainDataset(Dataset):
 def kl_divergence(mu, logvar):
     return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
-bce = nn.BCELoss()
+#bce = nn.BCELoss()
+bce = nn.BCEWithLogitsLoss()
 
-def train_ssm():
+
+def train_ssm(limit=None):
     # If no SSMs yet, run preparation first
     #check if preprocessed melodic/drum SSM pickles exist. If not, call prepare_dataset()
     if len(list(OUT_MEL_SSM.glob("*.pkl"))) == 0 or len(list(OUT_DRUM_SSM.glob("*.pkl"))) == 0:
         print("[info] No SSMs detected — preparing dataset from LPD via Pypianoroll...")
-        prepare_dataset(limit=None)
+        # prepare_dataset(limit=None)
+        prepare_dataset(limit=limit) # delete
 
     dataset = SSMTrainDataset(OUT_MEL_SSM, OUT_DRUM_SSM) #instantiate SSM Train Datatset
     assert len(dataset) > 0, "No paired SSM samples found."
@@ -479,6 +485,40 @@ def train_ssm():
     #last.pt -> very last epoch's weights
     #these two files are saved at: /drum_generation/checkpoints/ssm_generator/
 
+#change back
+# if __name__ == "__main__":
+#     train_ssm()
 
+# delete later
 if __name__ == "__main__":
-    train_ssm()
+    import argparse, os
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=None, help="limit #songs to prepare")
+    ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--dataset_root", type=str, default=None)
+    ap.add_argument("--device", type=str, default=None, help="cuda or cpu")
+    args = ap.parse_args()
+
+    # override globals if provided
+    if args.dataset_root:
+        DATASET_ROOT = Path(args.dataset_root)
+    if args.epochs:
+        NUM_EPOCHS = args.epochs
+    if args.batch_size:
+        BATCH_SIZE = args.batch_size
+    if args.device:
+        DEVICE = torch.device(args.device)
+
+    # pass limit into prepare if needed
+    # quick hack: set an env that prepare_dataset() can read
+    os.environ["PREP_LIMIT"] = str(args.limit) if args.limit is not None else ""
+
+    # small patch: change prepare_dataset(limit=None) call to:
+    #   limit_env = os.environ.get("PREP_LIMIT")
+    #   limit = int(limit_env) if limit_env else None
+    #   prepare_dataset(limit=limit)
+
+    #    train_ssm() 
+
+    train_ssm(limit=args.limit) # delete
