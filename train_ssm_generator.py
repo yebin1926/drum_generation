@@ -27,9 +27,10 @@ from models import SSMEncoder, SSMDecoder, SSMVAE, SSMDiscriminator
 # Config (paths, seeds, hyperparams)
 # -------------------------
 
-PROJECT_DIR   = Path("/home/marg_intern/marg_intern_2025/yebinpyun/drum_generation")
+# PROJECT_DIR   = Path("/home/marg_intern/marg_intern_2025/yebinpyun/drum_generation") #change to this later
+PROJECT_DIR   = Path("/workspace")
 DATASET_ROOT  = Path("/mnt/ssd2/marg_intern_2025_summer/yebinpyun")   # will scan **/*.npz
-SOUND_FONT    = Path("/usr/share/sounds/sf2/FluidR3_GM.sf2")          # change to your SF2
+SOUND_FONT    = Path("/workspace/sound_front_lib.sf2")      # change later to home ?
 
 OUT_PRE       = PROJECT_DIR / "pre_processed_data"
 OUT_MIDI_ALL  = OUT_PRE / "proc_all_tracks_mid"
@@ -134,7 +135,8 @@ def load_multitrack(npz_path: Path) -> ppr.Multitrack:
 def normalize_tempo_to_120(multitrack: ppr.Multitrack):
     """Set tempo array to 120 QPM uniformly (§3.1)."""
     T = multitrack_max_length_steps(multitrack)
-    multitrack.tempo = np.full((T, 1), TEMPO_QPM, dtype=float)
+    # multitrack.tempo = np.full((T, 1), TEMPO_QPM, dtype=float)
+    multitrack.tempo = np.full(T, TEMPO_QPM, dtype=float) #change to (T,) not (T, 1) so its 1D
     return multitrack
 
 def multitrack_max_length_steps(mt):
@@ -191,11 +193,8 @@ def slice_bars(track_roll: np.ndarray, bar_edges_steps: list, steps_per_bar=BAR_
 # -------------------------
 
 # --- deps ---
-import numpy as np
 import copy
 from typing import List, Tuple, Dict, Optional
-
-import pypianoroll as ppr
 import pretty_midi as pm
 
 
@@ -454,14 +453,8 @@ def prepare_one_song(npz_path: Path):
     # 2) Basic timeline length
     T = max((tr.pianoroll.shape[0] for tr in mt.tracks if tr.pianoroll is not None), default=0)
     print(f"[dbg] T (max time steps across tracks) = {T}")
-
-    # 3) Downbeat & tempo arrays
-    # Delete: wrong downbeat calculation
-    # db = mt.downbeat
-    # print(f"[dbg] downbeat.shape={db.shape}")
-    # db = db.squeeze()  # (T,1)->(T,)
-    # assert db.ndim == 1, "downbeat should be 1-D after squeeze."
-    # assert db.shape[0] == T, f"downbeat length {db.shape[0]} != T {T}"
+    # end: end of check
+    #dwfegrfd
 
     ## Fixed downbeat calculation
     pmidi = mt.to_pretty_midi()
@@ -486,14 +479,25 @@ def prepare_one_song(npz_path: Path):
         0, max(0, T-1)
     ).tolist()
 
-    # 3c) synthesize a 1-D downbeat vector 'db' of length T (for legacy code that expects it)
-    db = np.zeros(T, dtype=np.uint8)
-    if len(bar_edges_steps) > 0:
-        db[np.array(bar_edges_steps, dtype=int)] = 1
+    # Delete: need to patch downbeat assignment to boolean
+    # # 3c) synthesize a 1-D downbeat vector 'db' of length T (for legacy code that expects it)
+    # db = np.zeros(T, dtype=np.uint8)
+    # db[np.array(bar_edges_steps, dtype=int)] = 1 #added this to set it as 1D
+    # if len(bar_edges_steps) > 0:
+    #     db[np.array(bar_edges_steps, dtype=int)] = 1
+
+    # Synthesize a 1-D boolean downbeat vector: True at bar starts
+    idx = np.asarray(bar_edges_steps, dtype=int)
+    idx = idx[(idx >= 0) & (idx < T)]           # safety clipping
+
+    db = np.zeros(T, dtype=np.bool_)            # ← bool, not uint8/int
+    db[idx] = True
+    mt.downbeat = db                            # pypianoroll expects bool (T,)
 
     # (Optional) keep mt.downbeat consistent for any later code that still reads it
     # shape should be (T,1) in pypianoroll
-    mt.downbeat = db[:, None]
+    # mt.downbeat = db[:, None]
+    mt.downbeat = db #added this to set it as 1D
 
     # 3d) debug info similar to your old prints
     print(f"[dbg] synthesized db.shape={db.shape}, #ones={int(db.sum())}, first8_idxs={bar_edges_steps[:8]}")
@@ -545,13 +549,6 @@ def prepare_one_song(npz_path: Path):
     # Normalize tempo to 120 QPM so bar timing is consistent in audio (§3.1)
     mt = normalize_tempo_to_120(mt)
 
-    # delete : wrong downbeat computation
-    # # Downbeat indices (bar edges) at symbolic steps, then seconds
-    # bar_edges_steps = get_downbeat_indices(mt) #find where each bar starts as list
-    # if len(bar_edges_steps) < 2:
-    #     return None
-    # bar_edges_sec = steps_to_seconds(bar_edges_steps, resolution, TEMPO_QPM) #convert downbeat steps -> seconds
-
     ## --- Compute downbeats from PrettyMIDI (robust), then correct by note density ---
     # Important: do this AFTER normalize_tempo_to_120 so pmidi aligns with 120 QPM
     pmidi = mt.to_pretty_midi()
@@ -582,20 +579,29 @@ def prepare_one_song(npz_path: Path):
     midi_do  = OUT_MIDI_DO  / f"{stem}_drum_only.mid"
     ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do) 
 
+    # ----- Sanity check on shape of downbeat as 1D ---
+    print("[sanity] tempo shape:", getattr(mt, "tempo", None).shape)
+    print("[sanity] downbeat shape:", getattr(mt, "downbeat", None).shape)
+    print("[sanity] tempo dtype:", getattr(mt, "tempo", None).dtype)
+    print("[sanity] downbeat dtype:", getattr(mt, "downbeat", None).dtype)
+    assert mt.tempo.ndim == 1, "tempo must be 1-D"
+    assert mt.downbeat.ndim == 1, "downbeat must be 1-D"
+    # end: end of check
+
     # all tracks
-    ppr.write(str(midi_all), mt)   # LPD Pypianoroll write()  :contentReference[oaicite:6]{index=6}
+    ppr.write(mt, str(midi_all))   # LPD Pypianoroll write()  :contentReference[oaicite:6]{index=6}
 
     # no-drum (zero out drum track)
     mt_nd = mt.copy()
     mt_nd.tracks[drum_idx].pianoroll[:] = 0 #zeroing out drum tracl
-    ppr.write(str(midi_nd), mt_nd)
+    ppr.write(mt_nd, str(midi_nd))
 
     # drum-only (zero out other tracks)
     mt_do = mt.copy()
     for i, tr in enumerate(mt_do.tracks):
         if i != drum_idx:
             tr.pianoroll[:] = 0
-    ppr.write(str(midi_do), mt_do)
+    ppr.write(mt_do, str(midi_do))
 
     # Render no-drum to WAV (CQT input)
     wav_nd = OUT_WAV_ND / f"{stem}_no_drum.wav"
