@@ -23,6 +23,15 @@ import pypianoroll as ppr   # LPD NPZ <-> Multitrack I/O (recommended)  # see do
 
 from models import SSMEncoder, SSMDecoder, SSMVAE, SSMDiscriminator
 
+import time, csv, math, logging
+from collections import defaultdict
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
+
+
 # -------------------------
 # Config (paths, seeds, hyperparams)
 # -------------------------
@@ -440,8 +449,8 @@ def prepare_one_song(npz_path: Path):
     # 1) Which resolution attribute exists?
     res_attr = "beat_resolution" if hasattr(mt, "beat_resolution") else (
             "resolution"      if hasattr(mt, "resolution")      else None)
-    print(f"[dbg] res_attr={res_attr}  value={getattr(mt, res_attr, None)}")
-    assert res_attr is not None, "Multitrack has neither beat_resolution nor resolution."
+    # print(f"[dbg] res_attr={res_attr}  value={getattr(mt, res_attr, None)}")
+    # assert res_attr is not None, "Multitrack has neither beat_resolution nor resolution."
 
     resolution = int(getattr(mt, res_attr))
     steps_per_bar = resolution * 4
@@ -452,9 +461,8 @@ def prepare_one_song(npz_path: Path):
 
     # 2) Basic timeline length
     T = max((tr.pianoroll.shape[0] for tr in mt.tracks if tr.pianoroll is not None), default=0)
-    print(f"[dbg] T (max time steps across tracks) = {T}")
+    # print(f"[dbg] T (max time steps across tracks) = {T}")
     # end: end of check
-    #dwfegrfd
 
     ## Fixed downbeat calculation
     pmidi = mt.to_pretty_midi()
@@ -513,18 +521,18 @@ def prepare_one_song(npz_path: Path):
     print(f"[dbg] #downbeats={len(db_idx)}  first8={db_idx[:8]}")
 
     tempo = getattr(mt, "tempo", None)
-    if tempo is not None:
-        print(f"[dbg] tempo.shape={tempo.shape}  example first3={tempo[:3].ravel() if len(tempo)>0 else tempo}")
-    else:
-        print("[dbg] tempo not present on this Multitrack (ok; we normalize later).")
+    # if tempo is not None:
+    #     print(f"[dbg] tempo.shape={tempo.shape}  example first3={tempo[:3].ravel() if len(tempo)>0 else tempo}")
+    # else:
+    #     print("[dbg] tempo not present on this Multitrack (ok; we normalize later).")
 
     # 4) Drum track present?
     drum_idx = next((i for i,tr in enumerate(mt.tracks) if getattr(tr, "is_drum", False)), None)
-    print(f"[dbg] drum_idx={drum_idx}")
+    # print(f"[dbg] drum_idx={drum_idx}")
     assert drum_idx is not None, "No drum track found (this song will be skipped)."
 
     drum_roll = mt.tracks[drum_idx].pianoroll
-    print(f"[dbg] drum pianoroll shape={None if drum_roll is None else drum_roll.shape}")
+    # print(f"[dbg] drum pianoroll shape={None if drum_roll is None else drum_roll.shape}")
 
     # 5) Quick per-bar width check using your get_downbeat_indices()
     bar_edges_steps = [i for i in range(len(db)) if db[i]]
@@ -580,10 +588,10 @@ def prepare_one_song(npz_path: Path):
     ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do) 
 
     # ----- Sanity check on shape of downbeat as 1D ---
-    print("[sanity] tempo shape:", getattr(mt, "tempo", None).shape)
-    print("[sanity] downbeat shape:", getattr(mt, "downbeat", None).shape)
-    print("[sanity] tempo dtype:", getattr(mt, "tempo", None).dtype)
-    print("[sanity] downbeat dtype:", getattr(mt, "downbeat", None).dtype)
+    # print("[sanity] tempo shape:", getattr(mt, "tempo", None).shape)
+    # print("[sanity] downbeat shape:", getattr(mt, "downbeat", None).shape)
+    # print("[sanity] tempo dtype:", getattr(mt, "tempo", None).dtype)
+    # print("[sanity] downbeat dtype:", getattr(mt, "downbeat", None).dtype)
     assert mt.tempo.ndim == 1, "tempo must be 1-D"
     assert mt.downbeat.ndim == 1, "downbeat must be 1-D"
     # end: end of check
@@ -765,6 +773,62 @@ def kl_divergence(mu, logvar):
 #bce = nn.BCELoss()
 bce = nn.BCEWithLogitsLoss()
 
+# -------------------------
+# Helper Functions for Logging
+# -------------------------
+
+LOG_DIR = PROJECT_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def setup_logger(name="train"):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S")
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt); logger.addHandler(ch)
+    fh = logging.FileHandler(LOG_DIR / "ssm_train.log")
+    fh.setFormatter(fmt); logger.addHandler(fh)
+    return logger
+
+def count_params(m):
+    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+def grad_norm(model):
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            g = p.grad.data
+            total += float(g.norm(2).item()**2)
+    return math.sqrt(total) if total > 0 else 0.0
+
+def get_lr(optim):
+    return optim.param_groups[0]["lr"]
+
+def save_sample_png(epoch, stem, mel, drm, recon):
+    """mel/drm/recon: torch tensors in shape (1,1,256,256) or numpy (256,256)"""
+    if not _HAS_MPL: 
+        return
+    SAVE_DIR = PROJECT_DIR / "sample_pngs"
+    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    def _to_np(x):
+        if hasattr(x, "detach"):
+            x = x.detach().cpu().squeeze().numpy()
+        return x
+    mel_np = _to_np(mel); drm_np = _to_np(drm); rec_np = _to_np(recon)
+    diff = (rec_np - drm_np)
+    vmax = 1.0; vmin = 0.0
+    fig, axs = plt.subplots(1, 4, figsize=(14, 3))
+    axs[0].imshow(mel_np, cmap="magma", vmin=vmin, vmax=vmax); axs[0].set_title("Mel-SSM")
+    axs[1].imshow(drm_np, cmap="magma", vmin=vmin, vmax=vmax); axs[1].set_title("Drum-SSM (target)")
+    axs[2].imshow(rec_np, cmap="magma", vmin=vmin, vmax=vmax); axs[2].set_title("Recon")
+    axs[3].imshow(diff, cmap="bwr"); axs[3].set_title("Recon-Target")
+    for ax in axs: ax.axis("off")
+    fig.tight_layout()
+    out = SAVE_DIR / f"e{epoch:03d}_{stem}.png"
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
 
 def train_ssm(limit=None):
     # print("[dbg] mel_pkls =", sum(1 for _ in OUT_MEL_SSM.glob("*.pkl")))    #checking: how many precomputed pickles (melodic SSMs) you alr have
@@ -779,37 +843,37 @@ def train_ssm(limit=None):
     
     # checking begin
     # --- preflight: what’s on disk? ---
-    print("[dbg] MEL dir:", OUT_MEL_SSM.resolve(), "exists:", OUT_MEL_SSM.exists())
-    print("[dbg] DRM dir:", OUT_DRUM_SSM.resolve(), "exists:", OUT_DRUM_SSM.exists())
+    # print("[dbg] MEL dir:", OUT_MEL_SSM.resolve(), "exists:", OUT_MEL_SSM.exists())
+    # print("[dbg] DRM dir:", OUT_DRUM_SSM.resolve(), "exists:", OUT_DRUM_SSM.exists())
 
-    mel_files  = sorted(OUT_MEL_SSM.glob("song_barlv_ssm_*.pkl"))
-    drum_files = sorted(OUT_DRUM_SSM.glob("song_barlv_drum_ssm_*.pkl"))
-    print("[dbg] #mel_pkls:", len(mel_files), "  #drum_pkls:", len(drum_files))
-    print("[dbg] mel examples:", [p.name for p in mel_files[:5]])
-    print("[dbg] drm examples:", [p.name for p in drum_files[:5]])
+    # mel_files  = sorted(OUT_MEL_SSM.glob("song_barlv_ssm_*.pkl"))
+    # drum_files = sorted(OUT_DRUM_SSM.glob("song_barlv_drum_ssm_*.pkl"))
+    # print("[dbg] #mel_pkls:", len(mel_files), "  #drum_pkls:", len(drum_files))
+    # print("[dbg] mel examples:", [p.name for p in mel_files[:5]])
+    # print("[dbg] drm examples:", [p.name for p in drum_files[:5]])
 
     # stem matching
-    mel_stems  = {p.stem.replace("song_barlv_ssm_", "") for p in mel_files}
-    drum_stems = {p.stem.replace("song_barlv_drum_ssm_", "") for p in drum_files}
-    common     = sorted(mel_stems & drum_stems)
-    only_mel   = sorted(mel_stems - drum_stems)
-    only_drum  = sorted(drum_stems - mel_stems)
-    print("[dbg] #matched stems:", len(common))
-    print("[dbg] first matched stem:", (common[0] if common else None))
-    print("[dbg] mel-without-drum (up to 5):", only_mel[:5])
-    print("[dbg] drum-without-mel (up to 5):", only_drum[:5])
+    # mel_stems  = {p.stem.replace("song_barlv_ssm_", "") for p in mel_files}
+    # drum_stems = {p.stem.replace("song_barlv_drum_ssm_", "") for p in drum_files}
+    # common     = sorted(mel_stems & drum_stems)
+    # only_mel   = sorted(mel_stems - drum_stems)
+    # only_drum  = sorted(drum_stems - mel_stems)
+    # print("[dbg] #matched stems:", len(common))
+    # print("[dbg] first matched stem:", (common[0] if common else None))
+    # print("[dbg] mel-without-drum (up to 5):", only_mel[:5])
+    # print("[dbg] drum-without-mel (up to 5):", only_drum[:5])
 
-    # try loading one matched pair
-    if common:
-        stem = common[0]
-        import pickle, numpy as np, os
-        mpath = OUT_MEL_SSM  / f"song_barlv_ssm_{stem}.pkl"
-        dpath = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{stem}.pkl"
-        with open(mpath, "rb") as f: mel = pickle.load(f)
-        with open(dpath, "rb") as f: drm = pickle.load(f)
-        mel = np.asarray(mel); drm = np.asarray(drm)
-        print("[dbg] mel shape:", mel.shape, "range:", (mel.min(), mel.max()))
-        print("[dbg] drm shape:", drm.shape, "range:", (drm.min(), drm.max()))
+    # # try loading one matched pair
+    # if common:
+    #     stem = common[0]
+    #     import pickle, numpy as np, os
+    #     mpath = OUT_MEL_SSM  / f"song_barlv_ssm_{stem}.pkl"
+    #     dpath = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{stem }.pkl"
+    #     with open(mpath, "rb") as f: mel = pickle.load(f)
+    #     with open(dpath, "rb") as f: drm = pickle.load(f)
+    #     mel = np.asarray(mel); drm = np.asarray(drm)
+    #     print("[dbg] mel shape:", mel.shape, "range:", (mel.min(), mel.max()))
+    #     print("[dbg] drm shape:", drm.shape, "range:", (drm.min(), drm.max()))
     # checking end
 
     dataset = SSMTrainDataset(OUT_MEL_SSM, OUT_DRUM_SSM) #instantiate SSM Train Datatset
@@ -821,8 +885,12 @@ def train_ssm(limit=None):
     n_val   = n_total - n_train
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(SEED))
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, drop_last=True)
-    val_loader   = DataLoader(val_set,   batch_size=BATCH_SIZE, shuffle=False, num_workers=2, drop_last=False)
+    # --- after you compute train_set, val_set ---
+    train_bs = max(1, min(BATCH_SIZE, len(train_set)))
+    val_bs   = max(1, min(BATCH_SIZE, len(val_set)))  # avoid 0
+
+    train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=2, drop_last=False)
+    val_loader   = DataLoader(val_set,   batch_size=val_bs, shuffle=False, num_workers=2, drop_last=False)
 
     # Models (as in §4.4: 8 conv + 3 FC (+skip), 32-d latent)
     enc = SSMEncoder(in_channels=1, base_channels=64, latent_dim=32)
@@ -834,14 +902,42 @@ def train_ssm(limit=None):
     optG = torch.optim.Adam(vae.parameters(), lr=LR_GEN, betas=(BETA1, BETA2))
     optD = torch.optim.Adam(dis.parameters(), lr=LR_DIS, betas=(BETA1, BETA2))
 
+    # --- checking ---
+    logger = setup_logger("train")
+    csv_path = LOG_DIR / "ssm_metrics.csv"
+    if not csv_path.exists():
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch","split","G","D","rec","kl","gan","D_real","D_fake","lrG","lrD","gradG","gradD","secs"])
+
+    logger.info(f"dataset size: {len(dataset)}  (train: {len(train_set)}, val: {len(val_set)})")
+    logger.info(f"enc params: {count_params(enc):,}  dec params: {count_params(dec):,}  dis params: {count_params(dis):,}")
+    # quick forward shape sanity
+    mel0, drm0 = next(iter(train_loader))
+    mel0 = mel0.to(DEVICE)
+
+    vae.eval()
+    with torch.no_grad():
+        recon0, mu0, logvar0 = vae(mel0[:1])  # can keep 1 sample now
+    logger.info(
+        f"sanity forward: mel {tuple(mel0.shape)} -> recon {tuple(recon0.shape)}  "
+        f"mu {tuple(mu0.shape)} logvar {tuple(logvar0.shape)}"
+    )
+    # end: end of check
+
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
 
     for epoch in range(1, NUM_EPOCHS+1): #repeat NUM_EPOCHS times
+        t0 = time.time()
         vae.train(); dis.train() #train vae model and discriminator
-        total_G, total_D = 0.0, 0.0 
+        # total_G, total_D = 0.0, 0.0 
+        from collections import defaultdict
+        total = defaultdict(float)
+        num_batches = 0
 
         for mel, drm in train_loader: #for every (mel ssm, drum ssm) pair,
+            num_batches += 1
             mel, drm = mel.to(DEVICE), drm.to(DEVICE) #move to GPU/CPU as needed
 
             # --- Train D (Training discriminator) --- Teaching judge to tell real vs fake
@@ -852,7 +948,11 @@ def train_ssm(limit=None):
             pred_fake = dis(recon.detach()) #get D's score for the fake drum made by vae generator(should be 0)
             d_loss = 0.5 * (bce(pred_real, torch.ones_like(pred_real)) +
                             bce(pred_fake, torch.zeros_like(pred_fake)))    #BCE Loss on real & fake -> ipldd
+            if not torch.isfinite(d_loss):
+                #logger.info("NaN/Inf in d_loss — skipping batch")
+                continue
             d_loss.backward() #backprop according to this loss^
+            gnD = grad_norm(dis)
             optD.step() #next step?
 
             # --- Train G (Training VAE Generator) ---
@@ -863,40 +963,96 @@ def train_ssm(limit=None):
             pred_fake_for_G = dis(recon)            # discriminator's prediction for the fake output
             loss_gan = bce(pred_fake_for_G, torch.ones_like(pred_fake_for_G))
             g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan  #combine losses to get total loss for fooling discriminator
+            if not torch.isfinite(g_loss):
+                #logger.info("NaN/Inf in g_loss — skipping batch")
+                continue
             g_loss.backward()                       # run backprop
+            gnG = grad_norm(vae)
             optG.step()
 
-            total_G += g_loss.item()    #keep running totals so u can print avg generator/discriminator losses later
-            total_D += d_loss.item()
+            total["G"]   += g_loss.item()
+            total["D"]   += d_loss.item()
+            total["rec"] += loss_rec.item()
+            total["kl"]  += loss_kl.item()
+            total["gan"] += loss_gan.item()
+            total["Dreal"] += torch.sigmoid(pred_real).mean().item()
+            total["Dfake"] += torch.sigmoid(pred_fake).mean().item()
+            total["gnG"] += gnG
+            total["gnD"] += gnD
+
+            if num_batches % 100 == 0:
+                logger.info(f"[ep{epoch:03d} it{num_batches:05d}] "
+                            f"G={total['G']/num_batches:.4f} D={total['D']/num_batches:.4f} "
+                            f"rec={total['rec']/num_batches:.4f} kl={total['kl']/num_batches:.4f} gan={total['gan']/num_batches:.4f} "
+                            f"D(real)={total['Dreal']/num_batches:.3f} D(fake)={total['Dfake']/num_batches:.3f} "
+                            f"||∇G||={total['gnG']/num_batches:.2f} ||∇D||={total['gnD']/num_batches:.2f}")
 
         # validation
         vae.eval(); dis.eval()
+        from collections import defaultdict
+        val = defaultdict(float)
         with torch.no_grad(): #don't track gradients
-            val_G = 0.0
-            for mel, drm in val_loader: #for each validation batch
-                mel, drm = mel.to(DEVICE), drm.to(DEVICE) 
+            nvb = 0
+            for mel, drm in val_loader:
+                nvb += 1
+                mel, drm = mel.to(DEVICE), drm.to(DEVICE)
                 recon, mu, logvar = vae(mel)
                 loss_rec = F.mse_loss(recon, drm)
                 loss_kl  = kl_divergence(mu, logvar)
-                pred_fake = dis(recon)
+                pred_fake = dis(recon)          # logits
                 loss_gan = bce(pred_fake, torch.ones_like(pred_fake))
-                val_G += (LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan).item()
-            val_G /= max(1, len(val_loader))
+                g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan
+                val["G"]   += g_loss.item()
+                val["rec"] += loss_rec.item()
+                val["kl"]  += loss_kl.item()
+                val["gan"] += loss_gan.item()
+                val["Dfake"] += torch.sigmoid(pred_fake).mean().item()
+        for k in list(val.keys()):
+            val[k] /= max(1, nvb)
+        
+        secs = time.time() - t0
+        avgG = total["G"] / max(1, num_batches)
+        avgD = total["D"] / max(1, num_batches)
+        avgRec = total["rec"] / max(1, num_batches)
+        avgKl  = total["kl"]  / max(1, num_batches)
+        avgGan = total["gan"] / max(1, num_batches)
+        mDr = total["Dreal"]/ max(1, num_batches)
+        mDf = total["Dfake"]/ max(1, num_batches)
+        gnG  = total["gnG"] / max(1, num_batches)
+        gnD  = total["gnD"] / max(1, num_batches)
+        lrG, lrD = get_lr(optG), get_lr(optD)
 
-        avgG = total_G / max(1, len(train_loader)) #printing avg G and D loss
-        avgD = total_D / max(1, len(train_loader))
-        print(f"[Epoch {epoch:03d}]  G:{avgG:.4f}  D:{avgD:.4f}  ValG:{val_G:.4f}")
+        logger.info(f"[Epoch {epoch:03d}] "
+                    f"G:{avgG:.4f} D:{avgD:.4f} (rec {avgRec:.4f} kl {avgKl:.4f} gan {avgGan:.4f}) "
+                    f"D(real):{mDr:.3f} D(fake):{mDf:.3f} "
+                    f"ValG:{val['G']:.4f}  lrG:{lrG:.1e} lrD:{lrD:.1e}  "
+                    f"||∇G||:{gnG:.2f} ||∇D||:{gnD:.2f}  {secs:.1f}s")
+
+        with open(csv_path, "a", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([epoch,"train",avgG,avgD,avgRec,avgKl,avgGan,mDr,mDf,lrG,lrD,gnG,gnD,secs])
+            w.writerow([epoch,"val",val["G"],"",val["rec"],val["kl"],val["gan"],"",val["Dfake"],lrG,lrD,"","",secs])
+
+        # save a visual sample each epoch (if matplotlib available)
+        try:
+            mel_s, drm_s = next(iter(val_loader))
+            mel_s, drm_s = mel_s.to(DEVICE), drm_s.to(DEVICE)
+            with torch.no_grad():
+                recon_s, _, _ = vae(mel_s[:1])
+            save_sample_png(epoch, f"samp{epoch:03d}", mel_s[:1], drm_s[:1], recon_s[:1])
+        except Exception:
+            pass
 
         #if validation generator loss improved, save checkpoint
-        if val_G < best_val:
-            best_val = val_G
+        if val["G"] < best_val:
+            best_val = val["G"]
             torch.save({
                 "epoch": epoch,
                 "vae": vae.state_dict(),
                 "dis": dis.state_dict(),
                 "optG": optG.state_dict(),
                 "optD": optD.state_dict(),
-                "val": val_G
+                "val": best_val
             }, CKPT_DIR / "best.pt")
             print("  ✓ Saved best checkpoint.")
     
