@@ -1,3 +1,5 @@
 drum_generator_model/
 ssm_generator_model/
 sound_front_lib.sf2/
+pre_processed_data/
+checkpoints/

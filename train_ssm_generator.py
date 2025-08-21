@@ -20,10 +20,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 
 import pypianoroll as ppr   # LPD NPZ <-> Multitrack I/O (recommended)  # see docs
-
 from models import SSMEncoder, SSMDecoder, SSMVAE, SSMDiscriminator
 
 import time, csv, math, logging
+from tqdm.auto import tqdm
 from collections import defaultdict
 try:
     import matplotlib.pyplot as plt
@@ -41,16 +41,40 @@ PROJECT_DIR   = Path("/workspace")
 DATASET_ROOT  = Path("/mnt/ssd2/marg_intern_2025_summer/yebinpyun")   # will scan **/*.npz
 SOUND_FONT    = Path("/workspace/sound_front_lib.sf2")      # change later to home ?
 
-OUT_PRE       = PROJECT_DIR / "pre_processed_data"
-OUT_MIDI_ALL  = OUT_PRE / "proc_all_tracks_mid"
-OUT_MIDI_ND   = OUT_PRE / "proc_no_drum_mid"
-OUT_MIDI_DO   = OUT_PRE / "proc_drum_only_mid"
-OUT_WAV_ND    = OUT_PRE / "proc_no_drum_wav"
-OUT_OBJ_PKL   = OUT_PRE / "proc_midi_object.pkl"          # like step_1's object list (lightweight)
-OUT_CQT_POOL  = OUT_PRE / "cqt_pooled_data"               # per-bar pooled CQT (84 x 96 per bar)
-OUT_MEL_SSM   = OUT_PRE / "bar_level_cqt_ssm"             # melodic bar-level SSM (NxN)
-OUT_DRUM_SSM  = OUT_PRE / "bar_level_drum_ssm"            # drum bar-level SSM (NxN)
+# OUT_PRE       = PROJECT_DIR / "pre_processed_data"
+# OUT_MIDI_ALL  = OUT_PRE / "proc_all_tracks_mid"
+# OUT_MIDI_ND   = OUT_PRE / "proc_no_drum_mid"
+# OUT_MIDI_DO   = OUT_PRE / "proc_drum_only_mid"
+# OUT_WAV_ND    = OUT_PRE / "proc_no_drum_wav"
+# OUT_OBJ_PKL   = OUT_PRE / "proc_midi_object.pkl"          # like step_1's object list (lightweight)
+# OUT_CQT_POOL  = OUT_PRE / "cqt_pooled_data"               # per-bar pooled CQT (84 x 96 per bar)
+# OUT_MEL_SSM   = OUT_PRE / "bar_level_cqt_ssm"             # melodic bar-level SSM (NxN)
+# OUT_DRUM_SSM  = OUT_PRE / "bar_level_drum_ssm"            # drum bar-level SSM (NxN)
+OUT_PRE = None
+OUT_MIDI_ALL = None
+OUT_MIDI_ND  = None
+OUT_MIDI_DO  = None
+OUT_WAV_ND   = None
+OUT_OBJ_PKL  = None
+OUT_CQT_POOL = None
+OUT_MEL_SSM  = None
+OUT_DRUM_SSM = None
 CKPT_DIR      = PROJECT_DIR / "checkpoints" / "ssm_generator"
+
+def configure_paths():
+    """Configure all preprocessing output paths under DATASET_ROOT/pre_processed_data."""
+    global OUT_PRE, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO, OUT_WAV_ND
+    global OUT_OBJ_PKL, OUT_CQT_POOL, OUT_MEL_SSM, OUT_DRUM_SSM
+
+    OUT_PRE       = (DATASET_ROOT / "pre_processed_data").resolve()
+    OUT_MIDI_ALL  = OUT_PRE / "proc_all_tracks_mid"
+    OUT_MIDI_ND   = OUT_PRE / "proc_no_drum_mid"
+    OUT_MIDI_DO   = OUT_PRE / "proc_drum_only_mid"
+    OUT_WAV_ND    = OUT_PRE / "proc_no_drum_wav"
+    OUT_OBJ_PKL   = OUT_PRE / "proc_midi_object.pkl"
+    OUT_CQT_POOL  = OUT_PRE / "cqt_pooled_data"
+    OUT_MEL_SSM   = OUT_PRE / "bar_level_cqt_ssm"
+    OUT_DRUM_SSM  = OUT_PRE / "bar_level_drum_ssm"
 
 # training
 SEED = 42
@@ -74,6 +98,11 @@ TEMPO_QPM = 120.0         # normalize tempo (§3.1)
 SR = 44100
 HOP = 256                 # CQT hop (matches your step_1)
 N_BINS = 84               # pooled CQT freq bins (as in step_1)
+
+# --- housekeeping: control disk usage, delete if unnecessary ---
+KEEP_WAV  = False   # delete rendered WAVs right after we finish computing SSMs
+KEEP_MIDI = False   # delete MIDI variants right after SSMs are saved
+WRITE_META = False  # skip writing proc_midi_object.pkl (not used by training)
 
 
 # -------------------------
@@ -130,6 +159,43 @@ def pairwise_euclidean_bar_ssm(bar_mats: np.ndarray):
     dist2 = X2 + X2.T - 2.0 * (feat @ feat.T)
     np.maximum(dist2, 0.0, out=dist2)
     return np.sqrt(dist2).astype(np.float32)
+
+def safe_unlink(path: Path):
+    """Delete a file if it exists, ignoring 'file not found'."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[warn] could not delete {path}: {e}")
+
+def prune_empty_dirs(*dirs: Path):
+    """Remove empty directories (useful after file cleanup)."""
+    for d in dirs:
+        try:
+            if d.exists() and d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        except Exception as e:
+            print(f"[warn] could not remove empty dir {d}: {e}")
+
+def is_valid_ssm_pickle(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            arr = pickle.load(f)
+        arr = np.asarray(arr)
+        return arr.shape == (TARGET_BARS, TARGET_BARS) and np.isfinite(arr).all()
+    except Exception:
+        return False
+
+def atomic_pickle_dump(obj, dst: Path):
+    """Write pickle to a temp file then atomically rename -> no truncated files."""
+    ensure_dir(dst)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)
 
 
 # -------------------------
@@ -442,6 +508,22 @@ def prepare_one_song(npz_path: Path):
     - Compute drum SSM from symbolic drum bars (Euclidean)
     - Save both padded to 256 x 256
     """
+    # ---- skip if both pickles already exist ----
+    stem = npz_path.stem
+    fname_mel = OUT_MEL_SSM / f"song_barlv_ssm_{stem}.pkl"
+    fname_drm = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{stem}.pkl"
+    if fname_mel.exists() and fname_drm.exists():
+        print(f"[prep] (skip) {npz_path.name} -> SSMs already exist")
+        return {
+            "stem": stem,
+            "midi_all": "",
+            "midi_nd": "",
+            "midi_do": "",
+            "wav_nd": "",
+            "bars": None
+        }
+    # -------------------------------------------------
+
     mt = load_multitrack(npz_path) #lturn NPZ into Multitrack
 
     # --- checking start ---
@@ -674,12 +756,28 @@ def prepare_one_song(npz_path: Path):
     drum_ssm = minmax01(pad_to_256(drum_ssm)) # return max number, convert it to 256x256
 
     # ------- Save pickles to the same names our trainer expects -------
-    base = stem  # we’ll keep the raw stem
-    fname_mel = OUT_MEL_SSM / f"song_barlv_ssm_{base}.pkl"
-    fname_drm = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{base}.pkl"
-    ensure_dir(fname_mel); ensure_dir(fname_drm)
-    with open(fname_mel, "wb") as f: pickle.dump(mel_ssm, f)
-    with open(fname_drm, "wb") as f: pickle.dump(drum_ssm, f)
+    # base = stem  # we’ll keep the raw stem
+    # fname_mel = OUT_MEL_SSM / f"song_barlv_ssm_{base}.pkl"
+    # fname_drm = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{base}.pkl"
+
+    # before:
+    # ensure_dir(fname_mel); ensure_dir(fname_drm)
+    # with open(fname_mel, "wb") as f: pickle.dump(mel_ssm, f)
+    # with open(fname_drm, "wb") as f: pickle.dump(drum_ssm, f)
+    atomic_pickle_dump(mel_ssm, fname_mel)
+    atomic_pickle_dump(drum_ssm, fname_drm)
+
+    # --- CLEAN UP intermediates ASAP to save disk ---
+    if not KEEP_WAV:
+        safe_unlink(wav_nd)  # delete rendered WAV once we've extracted features
+
+    if not KEEP_MIDI:
+        safe_unlink(midi_all)
+        safe_unlink(midi_nd)
+        safe_unlink(midi_do)
+    
+    # Optionally prune now-empty folders (harmless if not empty)
+    prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
 
     # (Optional) save a lightweight “midi object list” entry (compat with your older pipeline)
     # Only saving what we need now
@@ -693,6 +791,13 @@ def prepare_one_song(npz_path: Path):
     }
 
 def prepare_dataset(limit=None):
+
+    if OUT_PRE is None or OUT_MEL_SSM is None or OUT_DRUM_SSM is None \
+       or OUT_MIDI_ALL is None or OUT_MIDI_ND is None or OUT_MIDI_DO is None \
+       or OUT_WAV_ND is None:
+        configure_paths()
+    # ... existing code ...
+
     #create output folders
     OUT_MIDI_ALL.mkdir(parents=True, exist_ok=True)
     OUT_MIDI_ND.mkdir(parents=True, exist_ok=True)
@@ -705,6 +810,16 @@ def prepare_dataset(limit=None):
     # print("[dbg] first_10_npz =", list_npz_files(DATASET_ROOT)[:10]) #checking: list firrst few npz files found under DATASET_ROOT & print total count
     #finds all npz files
     npz_files = list_npz_files(DATASET_ROOT)
+    
+    # ---- skip stems that already have both pickles ----
+    # filters the list of npz files it will iterate over
+    have_mel  = {p.stem.replace("song_barlv_ssm_", "") for p in OUT_MEL_SSM.glob("*.pkl")}
+    have_drm  = {p.stem.replace("song_barlv_drum_ssm_", "") for p in OUT_DRUM_SSM.glob("*.pkl")}
+    already   = have_mel & have_drm
+    if already:
+        print(f"[prep] skipping {len(already)} songs that already have both pickles.")
+    npz_files = [p for p in npz_files if p.stem not in already]
+    # --------------------------------------------------------
 
     # # --- checking start ---
     # print("[dbg] DATASET_ROOT:", DATASET_ROOT.resolve(), "exists:", DATASET_ROOT.exists())
@@ -724,21 +839,33 @@ def prepare_dataset(limit=None):
         npz_files = npz_files[:limit]
 
     meta = []
-    for i, p in enumerate(npz_files, 1): #for each npz file,
+    n_ok = n_skip = n_err = 0
+
+    pbar = tqdm(npz_files, desc="[prep] songs", unit="song", dynamic_ncols=True)
+
+    for i, p in enumerate(pbar, 1): #for each npz file, #used to be npz_files
         try:
-            info = prepare_one_song(p) #process the data inside, collect per-song metadata (paths, #bars)
+            info = prepare_one_song(p)
             if info is not None:
                 meta.append(info)
-                print(f"[prep] {i}/{len(npz_files)} {p.name} -> bars: {info['bars']}")
+                n_ok += 1
+                # keep the console quiet; show status in tqdm instead of prints
+                pbar.set_postfix_str(f"ok={n_ok} last={p.stem[-8:]}")
             else:
-                print(f"[prep] {i}/{len(npz_files)} {p.name} -> skipped (no drums or no bars)")
+                n_skip += 1
+                pbar.set_postfix_str(f"skipped={n_skip} last={p.stem[-8:]}")
         except Exception as e:
-            print(f"[prep] {i}/{len(npz_files)} {p.name} -> ERROR {e}")
+            n_err += 1
+            pbar.set_postfix_str(f"ERROR({n_err})={str(e)[:40]}")
 
-    ensure_dir(OUT_OBJ_PKL)
-    with open(OUT_OBJ_PKL, "wb") as f:
-        pickle.dump(meta, f)
-    print(f"[prep] done. saved meta with {len(meta)} items.")
+    if WRITE_META:
+        ensure_dir(OUT_OBJ_PKL)
+        with open(OUT_OBJ_PKL, "wb") as f:
+            pickle.dump(meta, f)
+        print(f"[prep] done. saved meta with {len(meta)} items.")
+    else:
+        print(f"[prep] done. processed {len(meta)} items (meta file skipped).")
+
 
 
 # -------------------------
@@ -831,15 +958,15 @@ def save_sample_png(epoch, stem, mel, drm, recon):
 
 
 def train_ssm(limit=None):
+    if OUT_PRE is None or OUT_MEL_SSM is None or OUT_DRUM_SSM is None \
+       or OUT_MIDI_ALL is None or OUT_MIDI_ND is None or OUT_MIDI_DO is None \
+       or OUT_WAV_ND is None:
+        configure_paths()
     # print("[dbg] mel_pkls =", sum(1 for _ in OUT_MEL_SSM.glob("*.pkl")))    #checking: how many precomputed pickles (melodic SSMs) you alr have
     # print("[dbg] drm_pkls =", sum(1 for _ in OUT_DRUM_SSM.glob("*.pkl")))   #checking: how many precomputed pickles (drum SSMs) you alr have
     # If no SSMs yet, run preparation first
 
-    #check if preprocessed melodic/drum SSM pickles exist. If not, call prepare_dataset()
-    if len(list(OUT_MEL_SSM.glob("*.pkl"))) == 0 or len(list(OUT_DRUM_SSM.glob("*.pkl"))) == 0:
-        print("[info] No SSMs detected — preparing dataset from LPD via Pypianoroll...")
-        # prepare_dataset(limit=None)
-        prepare_dataset(limit=limit) # delete
+    prepare_dataset(limit=limit)
     
     # checking begin
     # --- preflight: what’s on disk? ---
@@ -928,57 +1055,67 @@ def train_ssm(limit=None):
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
 
-    for epoch in range(1, NUM_EPOCHS+1): #repeat NUM_EPOCHS times
+    # progress bar over epochs
+    epbar = tqdm(range(1, NUM_EPOCHS + 1), desc="[epochs]", unit="ep", dynamic_ncols=True)
+    for epoch in epbar:  # repeat NUM_EPOCHS times
         t0 = time.time()
-        vae.train(); dis.train() #train vae model and discriminator
+        vae.train(); dis.train()  # train vae model and discriminator
         # total_G, total_D = 0.0, 0.0 
         from collections import defaultdict
         total = defaultdict(float)
         num_batches = 0
 
-        for mel, drm in train_loader: #for every (mel ssm, drum ssm) pair,
+        # progress bar over training batches
+        pbar = tqdm(
+            train_loader,
+            desc=f"[train] epoch {epoch}/{NUM_EPOCHS}",
+            unit="batch", leave=False, dynamic_ncols=True
+        )
+
+        for mel, drm in pbar:  # for every (mel ssm, drum ssm) pair,
             num_batches += 1
-            mel, drm = mel.to(DEVICE), drm.to(DEVICE) #move to GPU/CPU as needed
+            mel, drm = mel.to(DEVICE), drm.to(DEVICE)  # move to GPU/CPU as needed
 
             # --- Train D (Training discriminator) --- Teaching judge to tell real vs fake
-            optD.zero_grad(set_to_none=True) #zero the gradient buffers
-            with torch.no_grad(): #don't want to update generator while making fakes - no tracking for backprop needed
-                recon, mu_g, logvar_g = vae(mel) #fake drum SSM made by us - reconstruction loss
-            pred_real = dis(drm) #get D's score for the actual drum (should be 1)
-            pred_fake = dis(recon.detach()) #get D's score for the fake drum made by vae generator(should be 0)
+            optD.zero_grad(set_to_none=True)  # zero the gradient buffers
+            with torch.no_grad():  # don't want to update generator while making fakes - no tracking for backprop needed
+                recon, _, _ = vae(mel)  # fake drum SSM made by us - reconstruction loss
+            pred_real = dis(drm)         # get D's score for the actual drum (should be 1)
+            pred_fake = dis(recon.detach())  # get D's score for the fake drum made by vae generator(should be 0)
             d_loss = 0.5 * (bce(pred_real, torch.ones_like(pred_real)) +
-                            bce(pred_fake, torch.zeros_like(pred_fake)))    #BCE Loss on real & fake -> ipldd
+                            bce(pred_fake, torch.zeros_like(pred_fake)))    # BCE Loss on real & fake -> ipldd
             if not torch.isfinite(d_loss):
-                #logger.info("NaN/Inf in d_loss — skipping batch")
+                # logger.info("NaN/Inf in d_loss — skipping batch")
                 continue
-            d_loss.backward() #backprop according to this loss^
+            d_loss.backward()  # backprop according to this loss^
             gnD = grad_norm(dis)
-            optD.step() #next step?
+            optD.step()  # next step?
 
             # --- Train G (Training VAE Generator) ---
-            optG.zero_grad(set_to_none=True)        #zero the gradient buffers
-            recon, mu, logvar = vae(mel)            #get vae's output for melody input - make fake drum ssm, this time with grads!
-            loss_rec = F.mse_loss(recon, drm)       #recon loss (mse): helps predicted drum SSM be close to real drum ssm,
+            optG.zero_grad(set_to_none=True)        # zero the gradient buffers
+            recon, mu, logvar = vae(mel)            # get vae's output for melody input - make fake drum ssm, this time with grads!
+            loss_rec = F.mse_loss(recon, drm)       # recon loss (mse): helps predicted drum SSM be close to real drum ssm,
             loss_kl  = kl_divergence(mu, logvar)    # VAE regularizer - keeps latent space nice & gaussian
             pred_fake_for_G = dis(recon)            # discriminator's prediction for the fake output
             loss_gan = bce(pred_fake_for_G, torch.ones_like(pred_fake_for_G))
-            g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan  #combine losses to get total loss for fooling discriminator
+            g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan  # combine losses to get total loss for fooling discriminator
             if not torch.isfinite(g_loss):
-                #logger.info("NaN/Inf in g_loss — skipping batch")
+                # logger.info("NaN/Inf in g_loss — skipping batch")
                 continue
             g_loss.backward()                       # run backprop
             gnG = grad_norm(vae)
             optG.step()
 
-            total["G"]   += g_loss.item()
-            total["D"]   += d_loss.item()
-            total["rec"] += loss_rec.item()
-            total["kl"]  += loss_kl.item()
-            total["gan"] += loss_gan.item()
+            # keep running totals so u can print avg generator/discriminator losses later
+            total["G"]     += g_loss.item()
+            total["D"]     += d_loss.item()
+            total["rec"]   += loss_rec.item()
+            total["kl"]    += loss_kl.item()
+            total["gan"]   += loss_gan.item()
             total["Dreal"] += torch.sigmoid(pred_real).mean().item()
             total["Dfake"] += torch.sigmoid(pred_fake).mean().item()
-            total["gnG"] += gnG
-            total["gnD"] += gnD
+            total["gnG"]   += gnG
+            total["gnD"]   += gnD
 
             if num_batches % 100 == 0:
                 logger.info(f"[ep{epoch:03d} it{num_batches:05d}] "
@@ -987,65 +1124,100 @@ def train_ssm(limit=None):
                             f"D(real)={total['Dreal']/num_batches:.3f} D(fake)={total['Dfake']/num_batches:.3f} "
                             f"||∇G||={total['gnG']/num_batches:.2f} ||∇D||={total['gnD']/num_batches:.2f}")
 
+            # live postfix on the tqdm bar
+            pbar.set_postfix({
+                "G":     f"{total['G']/num_batches:.3f}",
+                "D":     f"{total['D']/num_batches:.3f}",
+                "rec":   f"{total['rec']/num_batches:.3f}",
+                "kl":    f"{total['kl']/num_batches:.3f}",
+                "gan":   f"{total['gan']/num_batches:.3f}",
+                "Dr":    f"{total['Dreal']/num_batches:.2f}",
+                "Df":    f"{total['Dfake']/num_batches:.2f}",
+                "||∇G||": f"{total['gnG']/num_batches:.2f}",
+                "||∇D||": f"{total['gnD']/num_batches:.2f}",
+            })
+
+        pbar.close()
+
         # validation
         vae.eval(); dis.eval()
         from collections import defaultdict
         val = defaultdict(float)
-        with torch.no_grad(): #don't track gradients
+        with torch.no_grad():  # don't track gradients
             nvb = 0
-            for mel, drm in val_loader:
-                nvb += 1
-                mel, drm = mel.to(DEVICE), drm.to(DEVICE)
-                recon, mu, logvar = vae(mel)
-                loss_rec = F.mse_loss(recon, drm)
-                loss_kl  = kl_divergence(mu, logvar)
-                pred_fake = dis(recon)          # logits
-                loss_gan = bce(pred_fake, torch.ones_like(pred_fake))
-                g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan
-                val["G"]   += g_loss.item()
-                val["rec"] += loss_rec.item()
-                val["kl"]  += loss_kl.item()
-                val["gan"] += loss_gan.item()
-                val["Dfake"] += torch.sigmoid(pred_fake).mean().item()
+            if len(val_loader) > 0:
+                vbar = tqdm(
+                    val_loader,
+                    desc=f"[val]   epoch {epoch}/{NUM_EPOCHS}",
+                    unit="batch", leave=False, dynamic_ncols=True
+                )
+                for mel, drm in vbar:  # for each validation batch
+                    nvb += 1
+                    mel, drm = mel.to(DEVICE), drm.to(DEVICE) 
+                    recon, mu, logvar = vae(mel)
+                    loss_rec = F.mse_loss(recon, drm)
+                    loss_kl  = kl_divergence(mu, logvar)
+                    pred_fake = dis(recon)          # logits
+                    loss_gan = bce(pred_fake, torch.ones_like(pred_fake))
+                    g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan
+                    val["G"]     += g_loss.item()
+                    val["rec"]   += loss_rec.item()
+                    val["kl"]    += loss_kl.item()
+                    val["gan"]   += loss_gan.item()
+                    val["Dfake"] += torch.sigmoid(pred_fake).mean().item()
+                    vbar.set_postfix({"ValG": f"{val['G']/nvb:.3f}"})
+                vbar.close()
+
         for k in list(val.keys()):
             val[k] /= max(1, nvb)
         
-        secs = time.time() - t0
-        avgG = total["G"] / max(1, num_batches)
-        avgD = total["D"] / max(1, num_batches)
-        avgRec = total["rec"] / max(1, num_batches)
-        avgKl  = total["kl"]  / max(1, num_batches)
-        avgGan = total["gan"] / max(1, num_batches)
-        mDr = total["Dreal"]/ max(1, num_batches)
-        mDf = total["Dfake"]/ max(1, num_batches)
-        gnG  = total["gnG"] / max(1, num_batches)
-        gnD  = total["gnD"] / max(1, num_batches)
+        secs  = time.time() - t0
+        avgG  = total["G"]   / max(1, num_batches)
+        avgD  = total["D"]   / max(1, num_batches)
+        avgRec= total["rec"] / max(1, num_batches)
+        avgKl = total["kl"]  / max(1, num_batches)
+        avgGan= total["gan"] / max(1, num_batches)
+        mDr   = total["Dreal"]/ max(1, num_batches)
+        mDf   = total["Dfake"]/ max(1, num_batches)
+        gnGm  = total["gnG"]  / max(1, num_batches)
+        gnDm  = total["gnD"]  / max(1, num_batches)
         lrG, lrD = get_lr(optG), get_lr(optD)
 
         logger.info(f"[Epoch {epoch:03d}] "
                     f"G:{avgG:.4f} D:{avgD:.4f} (rec {avgRec:.4f} kl {avgKl:.4f} gan {avgGan:.4f}) "
                     f"D(real):{mDr:.3f} D(fake):{mDf:.3f} "
-                    f"ValG:{val['G']:.4f}  lrG:{lrG:.1e} lrD:{lrD:.1e}  "
-                    f"||∇G||:{gnG:.2f} ||∇D||:{gnD:.2f}  {secs:.1f}s")
+                    f"ValG:{val.get('G', float('nan')):.4f}  lrG:{lrG:.1e} lrD:{lrD:.1e}  "
+                    f"||∇G||:{gnGm:.2f} ||∇D||:{gnDm:.2f}  {secs:.1f}s")
+
+        # update epoch bar summary
+        epbar.set_postfix({
+            "G":    f"{avgG:.3f}",
+            "ValG": f"{val.get('G', float('nan')):.3f}",
+            "secs": f"{secs:.1f}",
+        })
 
         with open(csv_path, "a", newline="") as f:
             w = csv.writer(f)
-            w.writerow([epoch,"train",avgG,avgD,avgRec,avgKl,avgGan,mDr,mDf,lrG,lrD,gnG,gnD,secs])
-            w.writerow([epoch,"val",val["G"],"",val["rec"],val["kl"],val["gan"],"",val["Dfake"],lrG,lrD,"","",secs])
+            w.writerow([epoch,"train",avgG,avgD,avgRec,avgKl,avgGan,mDr,mDf,lrG,lrD,gnGm,gnDm,secs])
+            w.writerow([epoch,"val",val.get("G", float("nan")),"",val.get("rec", float("nan")),
+                        val.get("kl", float("nan")),val.get("gan", float("nan")),"",
+                        val.get("Dfake", float("nan")),lrG,lrD,"","",secs])
 
         # save a visual sample each epoch (if matplotlib available)
         try:
-            mel_s, drm_s = next(iter(val_loader))
-            mel_s, drm_s = mel_s.to(DEVICE), drm_s.to(DEVICE)
-            with torch.no_grad():
-                recon_s, _, _ = vae(mel_s[:1])
-            save_sample_png(epoch, f"samp{epoch:03d}", mel_s[:1], drm_s[:1], recon_s[:1])
+            if len(val_loader) > 0:
+                mel_s, drm_s = next(iter(val_loader))
+                mel_s, drm_s = mel_s.to(DEVICE), drm_s.to(DEVICE)
+                with torch.no_grad():
+                    recon_s, _, _ = vae(mel_s[:1])
+                save_sample_png(epoch, f"samp{epoch:03d}", mel_s[:1], drm_s[:1], recon_s[:1])
         except Exception:
             pass
 
-        #if validation generator loss improved, save checkpoint
-        if val["G"] < best_val:
-            best_val = val["G"]
+        # if validation generator loss improved, save checkpoint
+        current_valG = val.get("G", float("inf"))
+        if current_valG < best_val:
+            best_val = current_valG
             torch.save({
                 "epoch": epoch,
                 "vae": vae.state_dict(),
@@ -1109,6 +1281,10 @@ if __name__ == "__main__":
         BETA1 = args.beta1
     if args.beta2 is not None:
         BETA2 = args.beta2
+    
+    configure_paths()
+    print(f"[paths] DATASET_ROOT={DATASET_ROOT}")
+    print(f"[paths] OUT_PRE={OUT_PRE}")
 
 
     # pass limit into prepare if needed
