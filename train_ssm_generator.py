@@ -81,7 +81,7 @@ SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
-NUM_EPOCHS = 50
+NUM_EPOCHS = 60
 # LR_GEN = 2e-4
 # LR_DIS = 2e-4
 LR_GEN = 1e-4
