@@ -529,7 +529,8 @@ def estimate_global_tempo(pmidi: pm.PrettyMIDI) -> float:
 # Build melodic and drum SSMs for each NPZ
 # -------------------------
 
-def prepare_one_song(npz_path: Path):
+# def prepare_one_song(npz_path: Path): #change later to this
+def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     """
     - Load LPD NPZ with Pypianoroll
     - Force tempo to 120 QPM
@@ -772,6 +773,20 @@ def prepare_one_song(npz_path: Path):
         bar_img = np.stack(note_feats, axis=1)  # (84, 96) stack to make it a 84x96 bar image
         bars_cqt.append(bar_img)
     bars_cqt = np.array(bars_cqt, dtype=np.float32)  # (B, 84, 96)
+    B = int(bars_cqt.shape[0])
+
+    # --- ADDED: cache per-bar CQTs so DrumGen can load without WAVs ---
+    try:
+        OUT_CQT_POOL.mkdir(parents=True, exist_ok=True)
+        cqt_npy = OUT_CQT_POOL / f"{stem}_bars_cqt.npy"
+        np.save(cqt_npy, bars_cqt)   # shape (B, 84, 96)
+        # print(f"[prep] cached CQT -> {cqt_npy}")  # optional debug
+    except Exception as e:
+        print(f"[prep] warning: failed to cache CQT for {stem}: {e}")
+    
+    # If we're called just to backfill CQT cache, stop here
+    if only_cache_cqt:
+        return {"stem": stem, "bars": int(B), "cached_only": True}
 
     # ------- Melodic SSM from CQT bars (Euclidean) -------
     mel_ssm = pairwise_euclidean_bar_ssm(bars_cqt)   # melodic SSM (B x B) sec 3.1
@@ -845,13 +860,18 @@ def prepare_dataset(limit=None):
     npz_files = list_npz_files(DATASET_ROOT)
     
     # ---- skip stems that already have both pickles ----
-    # filters the list of npz files it will iterate over
-    have_mel  = {p.stem.replace("song_barlv_ssm_", "") for p in OUT_MEL_SSM.glob("*.pkl")}
-    have_drm  = {p.stem.replace("song_barlv_drum_ssm_", "") for p in OUT_DRUM_SSM.glob("*.pkl")}
-    already   = have_mel & have_drm
-    if already:
-        print(f"[prep] skipping {len(already)} songs that already have both pickles.")
-    npz_files = [p for p in npz_files if p.stem not in already]
+    have_mel   = {p.stem.replace("song_barlv_ssm_", "") for p in OUT_MEL_SSM.glob("*.pkl")}
+    have_drm   = {p.stem.replace("song_barlv_drum_ssm_", "") for p in OUT_DRUM_SSM.glob("*.pkl")}
+    already    = have_mel & have_drm
+
+    def has_cqt(stem: str) -> bool:
+        return (OUT_CQT_POOL / f"{stem}_bars_cqt.npy").exists()
+
+    need_full  = [p for p in npz_files if p.stem not in already]                          # no pickles yet
+    need_cache = [p for p in npz_files if (p.stem in already) and (not has_cqt(p.stem))]  # pickles exist but cache missing
+
+    # process full ones first, then backfill caches
+    npz_files  = need_full + need_cache
     
     # ---- pass 1: scan drum-onset counts; compute μ/σ; keep μ ± kσ ----
     counts_map = {}
@@ -1085,7 +1105,6 @@ def train_ssm(limit=None):
     try:
         _mel, _drm = next(iter(val_loader))
         print(f"[dbg] val probe batch shapes: mel{tuple(_mel.shape)}  drm{tuple(_drm.shape)}")
-        import torch
         print(f"[dbg] val probe finite? mel={torch.isfinite(_mel).all().item()} drm={torch.isfinite(_drm).all().item()}")
     except StopIteration:
         print("[dbg] val probe: NO BATCHES")
