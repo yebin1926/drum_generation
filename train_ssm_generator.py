@@ -152,7 +152,7 @@ def pad_to_256(ssm: np.ndarray, fill_value=None):
     out = np.zeros((TARGET_BARS, TARGET_BARS), dtype=ssm.dtype)
     if fill_value is None:
         fill_value = float(np.max(ssm)) if n > 0 else 0.0
-    out[:] = fill_value
+    out[:] = float(fill_value)
     out[:n, :n] = ssm
     return out.astype(np.float32)
 
@@ -229,6 +229,31 @@ def drum_onset_count_from_npz(npz_path: Path) -> Optional[int]:
     except Exception:
         return None
 
+def regrid_bar_to_96(x_steps, start_idx, end_idx):
+    """
+    x_steps: np.ndarray with time-first axis [T, ...] (pianoroll frames, CQT frames, etc.)
+    start_idx, end_idx: integers in [0, x_steps.shape[0]] delimiting the bar in 'step' units
+    Returns: [96, ...] array resampled by averaging frames into 96 equal bins.
+    """
+    T = x_steps.shape[0]
+    start = int(max(0, min(T, start_idx)))
+    end   = int(max(0, min(T, end_idx)))
+    if end <= start:
+        # empty bar → return zeros like one frame
+        return np.zeros((96,) + x_steps.shape[1:], dtype=np.float32)
+
+    edges = np.linspace(start, end, 97)              # 96 bins ⇒ 97 edges
+    edges = np.clip(edges, 0, T).astype(int)
+
+    bins = []
+    for i in range(96):
+        a, b = edges[i], edges[i+1]
+        if b <= a:
+            # duplicate previous or zeros to avoid holes
+            bins.append(bins[-1].copy() if bins else np.zeros_like(x_steps[0]))
+        else:
+            bins.append(x_steps[a:b].mean(axis=0))
+    return np.stack(bins, axis=0).astype(np.float32)
 
 
 # -------------------------
@@ -658,7 +683,7 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         print(f"[dbg] first bar width in steps = {w0}  (expected ~ {steps_per_bar})")
     # --- checking end ---
 
-    resolution = int(mt.beat_resolution)      # steps per quarter (LPD default 24 fits 96 per bar)  :contentReference[oaicite:4]{index=4}
+    # resolution = int(mt.beat_resolution)      # steps per quarter (LPD default 24 fits 96 per bar)  :contentReference[oaicite:4]{index=4}
 
     # LPD-5 has 5 merged tracks: Drums, Piano, Guitar, Bass, Strings  :contentReference[oaicite:5]{index=5}
     # Find drum track index via is_drum
@@ -747,8 +772,17 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     # ------- Load audio & compute CQT -------
     y, sr = librosa.load(str(wav_nd), sr=SR, mono=True) #load WAV file using librosa
     dur = len(y) / sr 
-    cqt = librosa.cqt(y, sr=sr, hop_length=HOP) #compute CQT for bar-to-bar conversion into freq bins
+
+    # --- changed for wei-style nan inf handling
+    # cqt = librosa.cqt(y, sr=sr, hop_length=HOP) #compute CQT for bar-to-bar conversion into freq bins
+    # cqt_db = librosa.amplitude_to_db(np.abs(cqt), ref=np.max)
+    # fps = cqt_db.shape[1] / dur  # frames per second
+
+    cqt = librosa.cqt(y, sr=sr, hop_length=HOP)
     cqt_db = librosa.amplitude_to_db(np.abs(cqt), ref=np.max)
+    # NEW: replace non-finite & clamp to a reasonable floor/ceiling
+    cqt_db = np.nan_to_num(cqt_db, neginf=-120.0, posinf=0.0)
+    cqt_db = np.clip(cqt_db, -120.0, 0.0).astype(np.float32)
     fps = cqt_db.shape[1] / dur  # frames per second
 
     # Mean Pooling CQT per (bar, 96 bins) -> (84 x 96) bar "image"
@@ -772,7 +806,8 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
             note_feats.append(feat)
         bar_img = np.stack(note_feats, axis=1)  # (84, 96) stack to make it a 84x96 bar image
         bars_cqt.append(bar_img)
-    bars_cqt = np.array(bars_cqt, dtype=np.float32)  # (B, 84, 96)
+    # NEW: ensure finite features
+    bars_cqt = np.nan_to_num(bars_cqt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     B = int(bars_cqt.shape[0])
 
     # --- ADDED: cache per-bar CQTs so DrumGen can load without WAVs ---
@@ -789,8 +824,12 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         return {"stem": stem, "bars": int(B), "cached_only": True}
 
     # ------- Melodic SSM from CQT bars (Euclidean) -------
-    mel_ssm = pairwise_euclidean_bar_ssm(bars_cqt)   # melodic SSM (B x B) sec 3.1
-    mel_ssm = minmax01(pad_to_256(mel_ssm)) # return max number, convert it to 256x256
+    # mel_ssm = pairwise_euclidean_bar_ssm(bars_cqt)   # melodic SSM (B x B) sec 3.1
+    # mel_ssm = minmax01(pad_to_256(mel_ssm)) # return max number, convert it to 256x256
+    # -- changed for wei-style nan and inf handling
+    mel_ssm = pairwise_euclidean_bar_ssm(bars_cqt)
+    mel_ssm = np.nan_to_num(mel_ssm, nan=0.0, posinf=0.0, neginf=0.0)
+    mel_ssm = minmax01(pad_to_256(mel_ssm))
 
     # ------- Drum SSM from symbolic drum bars (Euclidean) -------
     # Pull raw drum pianoroll (T, 128)
@@ -799,9 +838,14 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     drum_roll_bin = (drum_roll > 0).astype(np.float32)
     # slice into per-bar matrices (128, 96)
     drum_bars = slice_bars(drum_roll_bin, bar_edges_steps, steps_per_bar=BAR_STEPS)  # list of (128,96)
-    drum_bars = np.array(drum_bars, dtype=np.float32)  # (B,128,96)
-    drum_ssm = pairwise_euclidean_bar_ssm(drum_bars) # drum SSM (BxB)
-    drum_ssm = minmax01(pad_to_256(drum_ssm)) # return max number, convert it to 256x256
+    # drum_bars = np.array(drum_bars, dtype=np.float32)  # (B,128,96) # change for wei-style nan and inf handling
+    drum_bars = np.nan_to_num(drum_bars, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    # drum_ssm = pairwise_euclidean_bar_ssm(drum_bars) # drum SSM (BxB)
+    # drum_ssm = minmax01(pad_to_256(drum_ssm)) # return max number, convert it to 256x256
+    # -- changed for wei-style nan and inf handling
+    drum_ssm = pairwise_euclidean_bar_ssm(drum_bars)
+    drum_ssm = np.nan_to_num(drum_ssm, nan=0.0, posinf=0.0, neginf=0.0)
+    drum_ssm = minmax01(pad_to_256(drum_ssm))
 
     # ------- Save pickles to the same names our trainer expects -------
     # base = stem  # we’ll keep the raw stem
@@ -968,6 +1012,9 @@ class SSMTrainDataset(Dataset):
         with open(dpath, "rb") as f: drm = pickle.load(f)  # (256,256)
         mel = torch.from_numpy(mel[None, ...]).float()
         drm = torch.from_numpy(drm[None, ...]).float()
+        # sanitize: replace NaN/Inf and clamp to [0,1]
+        mel = torch.nan_to_num(mel, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        drm = torch.nan_to_num(drm, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
         return mel, drm
 
 
@@ -1288,43 +1335,47 @@ def train_ssm(limit=None):
 
         with torch.no_grad():
             nvb = 0
+            good = 0
+            bad_inp = bad_fwd = bad_loss = 0
             for mel, drm in val_loader:
-
                 nvb += 1
+                if not torch.isfinite(mel).all() or not torch.isfinite(drm).all():
+                    bad_inp += 1
+                    continue
                 mel, drm = mel.to(DEVICE), drm.to(DEVICE)
 
-                # --- DEBUG: validate inputs are finite ---
-                if not torch.isfinite(mel).all():
-                    print("[val dbg] mel contains non-finite values"); 
-                    print("  mel stats:", float(torch.nan_to_num(mel).min()), float(torch.nan_to_num(mel).max()))
-                if not torch.isfinite(drm).all():
-                    print("[val dbg] drm contains non-finite values"); 
-                    print("  drm stats:", float(torch.nan_to_num(drm).min()), float(torch.nan_to_num(drm).max()))
-                # --- end" end of debug
-
-
-                # --- debug: check error regarding valG: nan
-
                 recon, mu, logvar = vae(mel)
+                if (not torch.isfinite(recon).all() or
+                    not torch.isfinite(mu).all() or
+                    not torch.isfinite(logvar).all()):
+                    bad_fwd += 1
+                    continue
 
-                # reconstruction & KL only (mean reduction)
                 loss_rec = F.mse_loss(recon, drm, reduction='mean')
                 loss_kl  = kl_divergence(mu, logvar)
+                g_loss   = LAMBDA_REC * loss_rec + LAMBDA_KL * loss_kl
 
-                # g_val = LAMBDA_REC * loss_rec + beta_val * loss_kl  # no adversarial term on val
-                g_loss = LAMBDA_REC * loss_rec + LAMBDA_KL * loss_kl
+                if (not torch.isfinite(g_loss) or
+                    not torch.isfinite(loss_rec) or
+                    not torch.isfinite(loss_kl)):
+                    bad_loss += 1
+                    continue
 
-                # accumulate
+                # accumulate only for good batches
+                good += 1
                 val["G"]   += g_loss.item()
                 val["rec"] += loss_rec.item()
                 val["kl"]  += loss_kl.item()
-                val["gan"] += 0.0          # keep key for logging/CSV compatibility
+                val["gan"] += 0.0
                 val["Dfake"] += 0.0
-                # val["Dfake"] += float('nan')  # not computed on val
-            print(f"[dbg] validation batches processed (nvb) = {nvb}")    
+
+        print(f"[dbg] validation batches processed (nvb) = {nvb}")    
         for k in list(val.keys()):
-            val[k] /= max(1, nvb)
-        # end: validation end    
+            val[k] /= max(1, good)   # average over good batches
+        print(f"[val dbg] nvb={nvb} bad_inp={bad_inp} bad_fwd={bad_fwd} bad_loss={bad_loss} good={good}")
+        # end: validation end   
+
+        print(f"[val dbg] nvb={nvb} bad_inp={bad_inp} bad_fwd={bad_fwd} bad_loss={bad_loss}") 
         
         secs  = time.time() - t0
         avgG  = total["G"]   / max(1, num_batches)
