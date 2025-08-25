@@ -30,6 +30,7 @@ try:
     _HAS_MPL = True
 except Exception:
     _HAS_MPL = False
+from typing import Optional
 
 
 # -------------------------
@@ -103,6 +104,15 @@ N_BINS = 84               # pooled CQT freq bins (as in step_1)
 KEEP_WAV  = False   # delete rendered WAVs right after we finish computing SSMs
 KEEP_MIDI = False   # delete MIDI variants right after SSMs are saved
 WRITE_META = False  # skip writing proc_midi_object.pkl (not used by training)
+
+# schedules
+KL_WARMUP_EPOCHS = 20     # linearly ramp β from 0 -> 1 over 20 epochs
+GAN_START_EPOCH   = 5     # train VAE-only for first 5 epochs, then add GAN
+
+# --- data cleaning (Wei et al. style) ---
+DRUM_OUTLIER_SIGMA = 2.0   # keep songs whose drum-onset count lies within μ ± 2σ
+MIN_DRUM_ONSETS    = 8     # also require at least this many onsets (guards near-silence)
+
 
 
 # -------------------------
@@ -196,6 +206,29 @@ def atomic_pickle_dump(obj, dst: Path):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, dst)
+
+
+def drum_onset_count_from_npz(npz_path: Path) -> Optional[int]:
+    """
+    Fast, symbolic drum 'note onset' count:
+      - find the drum track (is_drum=True)
+      - binarize velocities
+      - count rising edges along time for ALL pitches (sums multiple hits per step)
+    Returns None if no drum track is present.
+    """
+    try:
+        mt = ppr.load(str(npz_path))
+        drum = next((tr for tr in mt.tracks if getattr(tr, "is_drum", False)), None)
+        if drum is None or drum.pianoroll is None or drum.pianoroll.size == 0:
+            return None
+        pr = (drum.pianoroll > 0).astype(np.uint8)   # (T,128)
+        first = pr[0, :].sum()
+        # rising edges over time for each pitch; sum counts per-pitch onsets
+        onsets = ((pr[1:, :] > 0) & (pr[:-1, :] == 0)).sum()
+        return int(first + onsets)
+    except Exception:
+        return None
+
 
 
 # -------------------------
@@ -819,6 +852,30 @@ def prepare_dataset(limit=None):
     if already:
         print(f"[prep] skipping {len(already)} songs that already have both pickles.")
     npz_files = [p for p in npz_files if p.stem not in already]
+    
+    # ---- pass 1: scan drum-onset counts; compute μ/σ; keep μ ± kσ ----
+    counts_map = {}
+    counts = []
+    for p in npz_files:
+        c = drum_onset_count_from_npz(p)
+        if c is not None:
+            counts_map[p] = c
+            counts.append(c)
+
+    if len(counts) == 0:
+        print("[clean] No songs with detectable drum track in this subset; nothing to prepare.")
+        npz_files = []
+    else:
+        mu  = float(np.mean(counts))
+        sig = float(np.std(counts))
+        lo  = max(MIN_DRUM_ONSETS, int(np.floor(mu - DRUM_OUTLIER_SIGMA * sig)))
+        hi  = int(np.ceil(mu + DRUM_OUTLIER_SIGMA * sig))
+        before = len(npz_files)
+        npz_files = [p for p in npz_files if (p in counts_map and lo <= counts_map[p] <= hi)]
+        print(f"[clean] drum-onset μ={mu:.1f} σ={sig:.1f} → keep in [{lo},{hi}] "
+              f"→ kept {len(npz_files)}/{before} ({before-len(npz_files)} filtered as outliers/empty)")
+
+
     # --------------------------------------------------------
 
     # # --- checking start ---
@@ -1019,6 +1076,34 @@ def train_ssm(limit=None):
     train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=2, drop_last=False)
     val_loader   = DataLoader(val_set,   batch_size=val_bs, shuffle=False, num_workers=2, drop_last=False)
 
+    # === DEBUG: dataset/batch sizes & one-batch probe ===
+    total_pairs = len(train_set) + len(val_set)
+    print(f"[dbg] after cleaning/pairing: total={total_pairs}  → train={len(train_set)}  val={len(val_set)}")
+    print(f"[dbg] batch sizes: train_bs={train_bs}  val_bs={val_bs}  drop_last(val)=False")
+
+    # quick probe: does val yield a batch at all?
+    try:
+        _mel, _drm = next(iter(val_loader))
+        print(f"[dbg] val probe batch shapes: mel{tuple(_mel.shape)}  drm{tuple(_drm.shape)}")
+        import torch
+        print(f"[dbg] val probe finite? mel={torch.isfinite(_mel).all().item()} drm={torch.isfinite(_drm).all().item()}")
+    except StopIteration:
+        print("[dbg] val probe: NO BATCHES")
+    # --- end: end of debug
+
+    # --- debug: dataset sizes & batch sizes ---
+    total_pairs = len(train_set) + len(val_set)
+    print(f"[dbg] after cleaning/pairing: total={total_pairs}  → train={len(train_set)}  val={len(val_set)}")
+    print(f"[dbg] batch sizes: train_bs={train_bs}  val_bs={val_bs}  drop_last(val)=False")
+
+    # probe whether validation can yield at least one batch
+    try:
+        _mel, _drm = next(iter(val_loader))
+        print(f"[dbg] val probe batch: mel{tuple(_mel.shape)}  drm{tuple(_drm.shape)}")
+    except StopIteration:
+        print("[dbg] val probe: NO BATCHES")
+    # end : end of debugging val nan error
+
     # Models (as in §4.4: 8 conv + 3 FC (+skip), 32-d latent)
     enc = SSMEncoder(in_channels=1, base_channels=64, latent_dim=32)
     dec = SSMDecoder(out_channels=1, base_channels=64, latent_dim=32)
@@ -1060,6 +1145,11 @@ def train_ssm(limit=None):
     for epoch in epbar:  # repeat NUM_EPOCHS times
         t0 = time.time()
         vae.train(); dis.train()  # train vae model and discriminator
+        # Linear β warmup for KL (0 -> 1 over KL_WARMUP_EPOCHS)
+        current_beta = min(1.0, float(epoch) / float(KL_WARMUP_EPOCHS))
+
+        # Two-stage: no GAN for early epochs, then enable
+        current_lambda_gan = (LAMBDA_GAN if epoch >= GAN_START_EPOCH else 0.0)
         # total_G, total_D = 0.0, 0.0 
         from collections import defaultdict
         total = defaultdict(float)
@@ -1077,19 +1167,24 @@ def train_ssm(limit=None):
             mel, drm = mel.to(DEVICE), drm.to(DEVICE)  # move to GPU/CPU as needed
 
             # --- Train D (Training discriminator) --- Teaching judge to tell real vs fake
-            optD.zero_grad(set_to_none=True)  # zero the gradient buffers
-            with torch.no_grad():  # don't want to update generator while making fakes - no tracking for backprop needed
-                recon, _, _ = vae(mel)  # fake drum SSM made by us - reconstruction loss
-            pred_real = dis(drm)         # get D's score for the actual drum (should be 1)
-            pred_fake = dis(recon.detach())  # get D's score for the fake drum made by vae generator(should be 0)
-            d_loss = 0.5 * (bce(pred_real, torch.ones_like(pred_real)) +
-                            bce(pred_fake, torch.zeros_like(pred_fake)))    # BCE Loss on real & fake -> ipldd
-            if not torch.isfinite(d_loss):
-                # logger.info("NaN/Inf in d_loss — skipping batch")
-                continue
-            d_loss.backward()  # backprop according to this loss^
-            gnD = grad_norm(dis)
-            optD.step()  # next step?
+            if current_lambda_gan > 0.0:
+                optD.zero_grad(set_to_none=True)  # zero the gradient buffers
+                with torch.no_grad():  # don't want to update generator while making fakes - no tracking for backprop needed
+                    recon, _, _ = vae(mel)  # fake drum SSM made by us - reconstruction loss
+                pred_real = dis(drm)         # get D's score for the actual drum (should be 1)
+                pred_fake = dis(recon.detach())  # get D's score for the fake drum made by vae generator(should be 0)
+                d_loss = 0.5 * (bce(pred_real, torch.ones_like(pred_real)) +
+                                bce(pred_fake, torch.zeros_like(pred_fake)))    # BCE Loss on real & fake -> ipldd
+                if torch.isfinite(d_loss):
+                    d_loss.backward()  # backprop according to this loss^
+                    gnD = grad_norm(dis)
+                    optD.step()  # next step?
+            else:
+                # skip D entirely during VAE pretrain
+                d_loss = torch.tensor(0.0, device=DEVICE)
+                pred_real = torch.zeros((drm.size(0),1), device=DEVICE)  # dummies for logging
+                pred_fake = torch.zeros((drm.size(0),1), device=DEVICE)
+                gnD = 0.0
 
             # --- Train G (Training VAE Generator) ---
             optG.zero_grad(set_to_none=True)        # zero the gradient buffers
@@ -1098,7 +1193,7 @@ def train_ssm(limit=None):
             loss_kl  = kl_divergence(mu, logvar)    # VAE regularizer - keeps latent space nice & gaussian
             pred_fake_for_G = dis(recon)            # discriminator's prediction for the fake output
             loss_gan = bce(pred_fake_for_G, torch.ones_like(pred_fake_for_G))
-            g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan  # combine losses to get total loss for fooling discriminator
+            g_loss = LAMBDA_REC*loss_rec + current_beta*loss_kl + current_lambda_gan*loss_gan  # combine losses to get total loss for fooling discriminator
             if not torch.isfinite(g_loss):
                 # logger.info("NaN/Inf in g_loss — skipping batch")
                 continue
@@ -1143,33 +1238,74 @@ def train_ssm(limit=None):
         vae.eval(); dis.eval()
         from collections import defaultdict
         val = defaultdict(float)
-        with torch.no_grad():  # don't track gradients
-            nvb = 0
-            if len(val_loader) > 0:
-                vbar = tqdm(
-                    val_loader,
-                    desc=f"[val]   epoch {epoch}/{NUM_EPOCHS}",
-                    unit="batch", leave=False, dynamic_ncols=True
-                )
-                for mel, drm in vbar:  # for each validation batch
-                    nvb += 1
-                    mel, drm = mel.to(DEVICE), drm.to(DEVICE) 
-                    recon, mu, logvar = vae(mel)
-                    loss_rec = F.mse_loss(recon, drm)
-                    loss_kl  = kl_divergence(mu, logvar)
-                    pred_fake = dis(recon)          # logits
-                    loss_gan = bce(pred_fake, torch.ones_like(pred_fake))
-                    g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan
-                    val["G"]     += g_loss.item()
-                    val["rec"]   += loss_rec.item()
-                    val["kl"]    += loss_kl.item()
-                    val["gan"]   += loss_gan.item()
-                    val["Dfake"] += torch.sigmoid(pred_fake).mean().item()
-                    vbar.set_postfix({"ValG": f"{val['G']/nvb:.3f}"})
-                vbar.close()
+        # with torch.no_grad():  # don't track gradients
+        #     nvb = 0
+        #     if len(val_loader) > 0:
+        #         vbar = tqdm(
+        #             val_loader,
+        #             desc=f"[val]   epoch {epoch}/{NUM_EPOCHS}",
+        #             unit="batch", leave=False, dynamic_ncols=True
+        #         )
+        #         for mel, drm in vbar:  # for each validation batch
+        #             nvb += 1
+        #             mel, drm = mel.to(DEVICE), drm.to(DEVICE) 
+        #             recon, mu, logvar = vae(mel)
+        #             loss_rec = F.mse_loss(recon, drm)
+        #             loss_kl  = kl_divergence(mu, logvar)
+        #             pred_fake = dis(recon)          # logits
+        #             loss_gan = bce(pred_fake, torch.ones_like(pred_fake))
+        #             g_loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_GAN*loss_gan
+        #             val["G"]     += g_loss.item()
+        #             val["rec"]   += loss_rec.item()
+        #             val["kl"]    += loss_kl.item()
+        #             val["gan"]   += loss_gan.item()
+        #             val["Dfake"] += torch.sigmoid(pred_fake).mean().item()
+        #             vbar.set_postfix({"ValG": f"{val['G']/nvb:.3f}"})
+        #         vbar.close()
 
+        ## rec + B*kl only, GAN omitted
+        # if you use a KL warmup in training, reuse the current beta; otherwise fall back to LAMBDA_KL
+        beta_val = current_beta
+
+        with torch.no_grad():
+            nvb = 0
+            for mel, drm in val_loader:
+
+                nvb += 1
+                mel, drm = mel.to(DEVICE), drm.to(DEVICE)
+
+                # --- DEBUG: validate inputs are finite ---
+                if not torch.isfinite(mel).all():
+                    print("[val dbg] mel contains non-finite values"); 
+                    print("  mel stats:", float(torch.nan_to_num(mel).min()), float(torch.nan_to_num(mel).max()))
+                if not torch.isfinite(drm).all():
+                    print("[val dbg] drm contains non-finite values"); 
+                    print("  drm stats:", float(torch.nan_to_num(drm).min()), float(torch.nan_to_num(drm).max()))
+                # --- end" end of debug
+
+
+                # --- debug: check error regarding valG: nan
+
+                recon, mu, logvar = vae(mel)
+
+                # reconstruction & KL only (mean reduction)
+                loss_rec = F.mse_loss(recon, drm, reduction='mean')
+                loss_kl  = kl_divergence(mu, logvar)
+
+                # g_val = LAMBDA_REC * loss_rec + beta_val * loss_kl  # no adversarial term on val
+                g_loss = LAMBDA_REC * loss_rec + LAMBDA_KL * loss_kl
+
+                # accumulate
+                val["G"]   += g_loss.item()
+                val["rec"] += loss_rec.item()
+                val["kl"]  += loss_kl.item()
+                val["gan"] += 0.0          # keep key for logging/CSV compatibility
+                val["Dfake"] += 0.0
+                # val["Dfake"] += float('nan')  # not computed on val
+            print(f"[dbg] validation batches processed (nvb) = {nvb}")    
         for k in list(val.keys()):
             val[k] /= max(1, nvb)
+        # end: validation end    
         
         secs  = time.time() - t0
         avgG  = total["G"]   / max(1, num_batches)

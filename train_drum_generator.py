@@ -68,7 +68,7 @@ N_INSTR = len(DRUM_KEEP_PITCHES)  # 46
 # Model / training
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 64
-NUM_EPOCHS = 60
+NUM_EPOCHS = 100
 LR = 1e-4
 BETA1, BETA2 = 0.5, 0.999
 LAMBDA_REC = 1.0
@@ -296,43 +296,50 @@ class DrumGenDataset(Dataset):
       Y: (1,256,256) float32 target image (upsampled from (46,16))
       c: (1,) float32 note density (0..1)
     """
-    def __init__(self, dataset_root: Path, limit_songs=None, k_neighbors=7, cache_cqt_to_disk=True):
+    def __init__(self,
+                 dataset_root: Path,
+                 limit_songs=None,
+                 k_neighbors: int = 7,
+                 cache_cqt_to_disk: bool = True,
+                 require_wav: bool = False):   # <-- new flag (default: don't require WAV)
         super().__init__()
         self.root = Path(dataset_root)
         self.k = k_neighbors
         self.cache_cqt_to_disk = cache_cqt_to_disk
+        self.require_wav = require_wav
 
-        # Collect candidate songs: require wav_no_drum + drum SSM pickle + npz file
+        # Collect candidate songs: require drum SSM pickle; WAV is optional unless require_wav=True
         npzs = list_npz_files(self.root)
-        stems = {}
-        for p in npzs:
-            stems[p.stem] = p
+        stems = {p.stem: p for p in npzs}
+
         samples = []
         for stem, npz in stems.items():
-            wav = load_no_drum_wav_path(stem)
-            ssm_p = load_drum_ssm_path(stem)
-            if wav.exists() and ssm_p.exists():
-                samples.append((stem, npz, wav, ssm_p))
+            wav_path = load_no_drum_wav_path(stem)               # /data/pre_processed_data/proc_no_drum_wav/{stem}_no_drum.wav
+            ssm_path = load_drum_ssm_path(stem)                  # /data/pre_processed_data/bar_level_drum_ssm/song_barlv_drum_ssm_{stem}.pkl
+
+            if ssm_path.exists() and (wav_path.exists() or not self.require_wav):
+                # store None for wav if it doesn't exist so __getitem__ can branch safely
+                samples.append((stem, npz, wav_path if wav_path.exists() else None, ssm_path))
+
         if limit_songs is not None:
             samples = samples[:limit_songs]
-        self.songs = samples  # list of tuples
+
+        self.songs = samples  # list[(stem, npz_path, wav_or_None, ssm_path)]
 
         # Build global index over bars
-        self.index = []  # (song_idx, bar_idx)
-        self.song_meta = []  # per-song cache: (B, ...) computed lazily
+        self.index = []       # (song_idx, bar_idx)
+        self.song_meta = []   # per-song cache: {"stem", "res", "B"}
+
         for si, (stem, npz, wav, ssm_p) in enumerate(self.songs):
-            # Just find B (bars) now via SSM size
-            with open(ssm_p, "rb") as f:
-                ssm = pickle.load(f)  # (256,256) padded 0..1
-            # Recover actual bar count by scanning padded diagonal until last <1 pad boundary
-            # We instead estimate from unpadded region: find rows/cols that are not all equal to border
-            # Simpler: derive B from npz downbeats
+            # Determine bar count B from NPZ downbeats (robust)
             mt = ppr.load(str(npz))
             res = int(getattr(mt, "beat_resolution", 24))
             db_steps = synth_downbeat_indices(mt)
             B = max(0, len(db_steps) - 1)
+
             self.index += [(si, b) for b in range(B)]
             self.song_meta.append({"stem": stem, "res": res, "B": B})
+
         print(f"[dataset] songs usable: {len(self.songs)}  total bars: {len(self.index)}")
 
         # In-memory cache per song
@@ -472,7 +479,7 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
     configure_paths(DATASET_ROOT, out_root)
 
     # Dataset (training uses ground-truth drum SSM for bar selection; testing would use predicted SSM) :contentReference[oaicite:2]{index=2}
-    ds = DrumGenDataset(DATASET_ROOT, limit_songs=limit, k_neighbors=7, cache_cqt_to_disk=True)
+    ds = DrumGenDataset(DATASET_ROOT, limit_songs=limit, k_neighbors=7, cache_cqt_to_disk=False, require_wav=False)
     assert len(ds) > 0, "Dataset is empty — ensure WAV_no_drum and drum SSM pickles exist."
 
     # Train/val split by bars
