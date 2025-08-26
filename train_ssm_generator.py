@@ -31,6 +31,8 @@ try:
 except Exception:
     _HAS_MPL = False
 from typing import Optional
+import traceback
+import copy
 
 
 # -------------------------
@@ -144,11 +146,16 @@ def minmax01(x: np.ndarray):
     return ((x - xmin) / (xmax - xmin)).astype(np.float32)
 
 def pad_to_256(ssm: np.ndarray, fill_value=None):
-    """Pad square SSM (N x N) to 256 x 256 (§3.1)."""
+    """Return a 256x256 SSM. If input is larger, crop; if smaller, pad."""
+    ssm = np.asarray(ssm)
+    assert ssm.ndim == 2 and ssm.shape[0] == ssm.shape[1], f"SSM must be square, got {ssm.shape}"
     n = ssm.shape[0]
-    assert ssm.shape[0] == ssm.shape[1]
-    if n == TARGET_BARS:
-        return ssm.astype(np.float32)
+
+    # If too long, crop to first 256 bars (paper: zero-pad to 256; for >256, truncation is standard)
+    if n >= TARGET_BARS:
+        return ssm[:TARGET_BARS, :TARGET_BARS].astype(np.float32)
+
+    # Else pad up to 256
     out = np.zeros((TARGET_BARS, TARGET_BARS), dtype=ssm.dtype)
     if fill_value is None:
         fill_value = float(np.max(ssm)) if n > 0 else 0.0
@@ -255,6 +262,78 @@ def regrid_bar_to_96(x_steps, start_idx, end_idx):
             bins.append(x_steps[a:b].mean(axis=0))
     return np.stack(bins, axis=0).astype(np.float32)
 
+def cleanup_intermediates_for_stems(stems):
+    """Delete leftover MID/WAV for given stems, respecting KEEP_*."""
+    for s in stems:
+        if not KEEP_WAV:
+            safe_unlink(OUT_WAV_ND   / f"{s}_no_drum.wav")
+        if not KEEP_MIDI:
+            safe_unlink(OUT_MIDI_ALL / f"{s}_all_tracks.mid")
+            safe_unlink(OUT_MIDI_ND  / f"{s}_no_drum.mid")
+            safe_unlink(OUT_MIDI_DO  / f"{s}_drum_only.mid")
+    prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
+
+def _as_colvec(x, T, dtype=None):
+    x = np.asarray(x)
+    if x.ndim == 0:
+        x = np.full((T,), x, dtype=dtype if dtype is not None else np.float32)
+    if x.ndim == 1:
+        x = x.reshape(T, 1)
+    if dtype is not None:
+        x = x.astype(dtype, copy=False)
+    return x
+
+def fix_multitrack_for_write(mt: ppr.Multitrack,
+                             bar_edges_steps: list,
+                             tempo_qpm: float = TEMPO_QPM) -> ppr.Multitrack:
+    """Force valid shapes for write(): same T for all tracks, 1D tempo & downbeat of length T."""
+    # 1) unify track lengths
+    T = multitrack_max_length_steps(mt)
+    for tr in mt.tracks:
+        pr = tr.pianoroll
+        if pr is None:
+            tr.pianoroll = np.zeros((T, 128), dtype=np.uint8)
+            continue
+        if pr.shape[0] < T:
+            pad = np.zeros((T - pr.shape[0], pr.shape[1]), dtype=pr.dtype)
+            tr.pianoroll = np.vstack([pr, pad])
+        elif pr.shape[0] > T:
+            tr.pianoroll = pr[:T]
+
+    # 2) tempo: 1D float array (T,)
+    if not isinstance(getattr(mt, "tempo", None), np.ndarray) or mt.tempo.ndim != 1 or mt.tempo.shape[0] != T:
+        mt.tempo = np.full((T,), float(tempo_qpm), dtype=np.float32)
+
+    # 3) downbeat: 1D bool array (T,)
+    db = getattr(mt, "downbeat", None)
+    ok = isinstance(db, np.ndarray) and db.ndim == 1 and db.shape[0] == T and db.dtype == np.bool_
+    if not ok:
+        db = np.zeros((T,), dtype=np.bool_)
+        idx = np.asarray(bar_edges_steps, dtype=int)
+        idx = idx[(idx >= 0) & (idx < T)]
+        db[idx] = True
+        mt.downbeat = db
+
+    return mt
+
+def log_mt(tag, mt):
+    def s(x):
+        try: return f"shape={x.shape}, ndim={x.ndim}, dtype={x.dtype}"
+        except: return "None" if x is None else str(type(x))
+    T = multitrack_max_length_steps(mt)
+    print(f"[{tag}] T={T} tempo:{s(getattr(mt,'tempo', None))} "
+          f"downbeat:{s(getattr(mt,'downbeat', None))}")
+
+def assert_mt_ok(mt, tag):
+    T = multitrack_max_length_steps(mt)
+    t = getattr(mt, "tempo", None)
+    db = getattr(mt, "downbeat", None)
+    def shp(x): return None if x is None else getattr(x, "shape", None)
+    print(f"[{tag}] T={T} tempo_shape={shp(t)} downbeat_shape={shp(db)}")
+    assert isinstance(t, np.ndarray) and t.ndim == 1 and t.shape[0] == T, \
+        f"tempo must be 1D len T, got {None if t is None else t.shape}"
+    assert isinstance(db, np.ndarray) and db.ndim == 1 and db.shape[0] == T, \
+        f"downbeat must be 1D len T, got {None if db is None else db.shape}"
 
 # -------------------------
 # LPD loading & bar slicing (Pypianoroll)
@@ -571,8 +650,17 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     stem = npz_path.stem
     fname_mel = OUT_MEL_SSM / f"song_barlv_ssm_{stem}.pkl"
     fname_drm = OUT_DRUM_SSM / f"song_barlv_drum_ssm_{stem}.pkl"
-    if fname_mel.exists() and fname_drm.exists():
-        print(f"[prep] (skip) {npz_path.name} -> SSMs already exist")
+    if fname_mel.exists() and fname_drm.exists() and not only_cache_cqt:
+        # still clean up intermediates to avoid clutter
+        if not KEEP_WAV:
+            safe_unlink(OUT_WAV_ND   / f"{stem}_no_drum.wav")
+        if not KEEP_MIDI:
+            safe_unlink(OUT_MIDI_ALL / f"{stem}_all_tracks.mid")
+            safe_unlink(OUT_MIDI_ND  / f"{stem}_no_drum.mid")
+            safe_unlink(OUT_MIDI_DO  / f"{stem}_drum_only.mid")
+        prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
+
+        print(f"[prep] (skip) {npz_path.name} -> SSMs exist; cleaned leftover WAV/MID")
         return {
             "stem": stem,
             "midi_all": "",
@@ -697,6 +785,7 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
 
     # Normalize tempo to 120 QPM so bar timing is consistent in audio (§3.1)
     mt = normalize_tempo_to_120(mt)
+    log_mt("post-normalize", mt)
 
     ## --- Compute downbeats from PrettyMIDI (robust), then correct by note density ---
     # Important: do this AFTER normalize_tempo_to_120 so pmidi aligns with 120 QPM
@@ -721,36 +810,41 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     bar_edges_steps = [int(round(t / sec_per_step)) for t in downbeats_sec]
     ## end: end of downbeat calculation
 
-    # Write three MIDI variants
+    # Normalize shapes so pypianoroll.write() won't complain
+    mt = fix_multitrack_for_write(mt, bar_edges_steps, TEMPO_QPM)
+
+    # --- Write three MIDI variants (single, safe block) ---
     stem = npz_path.stem
     midi_all = OUT_MIDI_ALL / f"{stem}_all_tracks.mid"
     midi_nd  = OUT_MIDI_ND  / f"{stem}_no_drum.mid"
     midi_do  = OUT_MIDI_DO  / f"{stem}_drum_only.mid"
-    ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do) 
+    ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do)
 
-    # ----- Sanity check on shape of downbeat as 1D ---
-    # print("[sanity] tempo shape:", getattr(mt, "tempo", None).shape)
-    # print("[sanity] downbeat shape:", getattr(mt, "downbeat", None).shape)
-    # print("[sanity] tempo dtype:", getattr(mt, "tempo", None).dtype)
-    # print("[sanity] downbeat dtype:", getattr(mt, "downbeat", None).dtype)
-    assert mt.tempo.ndim == 1, "tempo must be 1-D"
-    assert mt.downbeat.ndim == 1, "downbeat must be 1-D"
-    # end: end of check
+    # Ensure base mt has 1-D numpy arrays
+    mt.tempo    = np.asarray(mt.tempo,    dtype=np.float32).reshape(-1)
+    mt.downbeat = np.asarray(mt.downbeat, dtype=bool).reshape(-1)
+    assert_mt_ok(mt, "pre-write:all")
+    ppr.write(mt, str(midi_all))
 
-    # all tracks
-    ppr.write(mt, str(midi_all))   # LPD Pypianoroll write()  :contentReference[oaicite:6]{index=6}
-
-    # no-drum (zero out drum track)
+    # No-drum copy
     mt_nd = mt.copy()
-    mt_nd.tracks[drum_idx].pianoroll[:] = 0 #zeroing out drum tracl
+    mt_nd.tracks[drum_idx].pianoroll[:] = 0
+    # Reattach as explicit 1-D arrays on the copy (belt & suspenders)
+    mt_nd.tempo    = mt.tempo.copy()
+    mt_nd.downbeat = mt.downbeat.copy()
+    assert_mt_ok(mt_nd, "pre-write:no-drum")
     ppr.write(mt_nd, str(midi_nd))
 
-    # drum-only (zero out other tracks)
+    # Drum-only copy
     mt_do = mt.copy()
     for i, tr in enumerate(mt_do.tracks):
         if i != drum_idx:
             tr.pianoroll[:] = 0
+    mt_do.tempo    = mt.tempo.copy()
+    mt_do.downbeat = mt.downbeat.copy()
+    assert_mt_ok(mt_do, "pre-write:drum-only")
     ppr.write(mt_do, str(midi_do))
+
 
     # Render no-drum to WAV (CQT input)
     wav_nd = OUT_WAV_ND / f"{stem}_no_drum.wav"
@@ -770,44 +864,57 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         song_bar_grid_range_list.append(bar_grid)
 
     # ------- Load audio & compute CQT -------
-    y, sr = librosa.load(str(wav_nd), sr=SR, mono=True) #load WAV file using librosa
-    dur = len(y) / sr 
+    y, sr = librosa.load(str(wav_nd), sr=SR, mono=True)
+    dur = len(y) / sr
 
-    # --- changed for wei-style nan inf handling
-    # cqt = librosa.cqt(y, sr=sr, hop_length=HOP) #compute CQT for bar-to-bar conversion into freq bins
-    # cqt_db = librosa.amplitude_to_db(np.abs(cqt), ref=np.max)
-    # fps = cqt_db.shape[1] / dur  # frames per second
+    # Fix n_bins explicitly to match N_BINS (84) to avoid surprises
+    cqt = librosa.cqt(y, sr=sr, hop_length=HOP, n_bins=N_BINS, bins_per_octave=12)
+    cqt_mag = np.abs(cqt)
+    cqt_db  = librosa.amplitude_to_db(cqt_mag, ref=np.max)
 
-    cqt = librosa.cqt(y, sr=sr, hop_length=HOP)
-    cqt_db = librosa.amplitude_to_db(np.abs(cqt), ref=np.max)
-    # NEW: replace non-finite & clamp to a reasonable floor/ceiling
+    # Replace non-finite & clamp
     cqt_db = np.nan_to_num(cqt_db, neginf=-120.0, posinf=0.0)
     cqt_db = np.clip(cqt_db, -120.0, 0.0).astype(np.float32)
-    fps = cqt_db.shape[1] / dur  # frames per second
 
-    # Mean Pooling CQT per (bar, 96 bins) -> (84 x 96) bar "image"
-    # pool: swuashing bunch of CQT frames inside tiny frame window so that every bar ends up the same fixed size
+    # Defensive: assert expected CQT rows
+    assert cqt_db.ndim == 2, f"cqt_db.ndim={cqt_db.ndim}"
+    assert cqt_db.shape[0] == N_BINS, f"cqt_db rows {cqt_db.shape[0]} != N_BINS {N_BINS}"
+    n_frames = cqt_db.shape[1]
+    fps = n_frames / max(1e-9, dur)
+
+    # Mean pooling per (bar, 96 bins) -> (84 x 96)
     bars_cqt = []
-    for bar_grid in song_bar_grid_range_list: # for each bar in the song,
+    for bar_i, bar_grid in enumerate(song_bar_grid_range_list):
+        # Defensive: every bar grid must be 96x2
+        assert bar_grid.shape == (BAR_STEPS, 2), f"bar_grid[{bar_i}] shape {bar_grid.shape} != (96,2)"
         note_feats = []
-        for n in range(BAR_STEPS): #from 0 till 96,
-            t_start, t_end = bar_grid[n, 0], bar_grid[n, 1] 
-            f0 = int(np.round(t_start * fps))
-            f1 = int(np.round(t_end * fps))
+        for n in range(BAR_STEPS):
+            t_start, t_end = bar_grid[n, 0], bar_grid[n, 1]
+            f0 = int(np.floor(t_start * fps))
+            f1 = int(np.ceil(t_end * fps))
+            # Clamp into valid frame range
+            f0 = max(0, min(n_frames, f0))
+            f1 = max(0, min(n_frames, f1))
             if f1 <= f0:
-                # degenerate slice: reuse previous or zeros
-                if len(note_feats) == 0:
-                    feat = np.zeros((N_BINS,), dtype=np.float32)
-                else:
-                    feat = note_feats[-1]
+                feat = note_feats[-1] if note_feats else np.zeros((N_BINS,), dtype=np.float32)
             else:
-                slice_ = cqt_db[:, f0:f1] #grab CQT frames that fall inside the bin
-                feat = slice_.mean(axis=1).astype(np.float32)  # 84-dim. #average across time to make one 84-dim vector
+                slice_ = cqt_db[:, f0:f1]
+                # Defensive: slice always has shape (84, >=1)
+                if slice_.size == 0:
+                    feat = note_feats[-1] if note_feats else np.zeros((N_BINS,), dtype=np.float32)
+                else:
+                    feat = slice_.mean(axis=1).astype(np.float32)
+            # Defensive: ensure exact shape
+            if feat.shape != (N_BINS,):
+                raise ValueError(f"feat bad shape {feat.shape} at bar {bar_i}, bin {n}, f0={f0}, f1={f1}")
             note_feats.append(feat)
-        bar_img = np.stack(note_feats, axis=1)  # (84, 96) stack to make it a 84x96 bar image
+        bar_img = np.stack(note_feats, axis=1)  # (84, 96)
+        assert bar_img.shape == (N_BINS, BAR_STEPS), f"bar_img {bar_img.shape} != (84,96)"
         bars_cqt.append(bar_img)
-    # NEW: ensure finite features
-    bars_cqt = np.nan_to_num(bars_cqt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # Stack to (B,84,96) and clean NaNs
+    bars_cqt = np.stack(bars_cqt, axis=0).astype(np.float32)
+    bars_cqt = np.nan_to_num(bars_cqt, nan=0.0, posinf=0.0, neginf=0.0)
     B = int(bars_cqt.shape[0])
 
     # --- ADDED: cache per-bar CQTs so DrumGen can load without WAVs ---
@@ -821,6 +928,14 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     
     # If we're called just to backfill CQT cache, stop here
     if only_cache_cqt:
+        # clean up even on cache-only pass
+        if not KEEP_WAV:
+            safe_unlink(wav_nd)
+        if not KEEP_MIDI:
+            safe_unlink(midi_all)
+            safe_unlink(midi_nd)
+            safe_unlink(midi_do)
+        prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
         return {"stem": stem, "bars": int(B), "cached_only": True}
 
     # ------- Melodic SSM from CQT bars (Euclidean) -------
@@ -832,19 +947,22 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     mel_ssm = minmax01(pad_to_256(mel_ssm))
 
     # ------- Drum SSM from symbolic drum bars (Euclidean) -------
-    # Pull raw drum pianoroll (T, 128)
-    drum_roll = mt.tracks[drum_idx].pianoroll  # shape (T, 128)
-    # Binarize velocities for SSM (paper uses symbolic drum matrices)
-    drum_roll_bin = (drum_roll > 0).astype(np.float32)
-    # slice into per-bar matrices (128, 96)
-    drum_bars = slice_bars(drum_roll_bin, bar_edges_steps, steps_per_bar=BAR_STEPS)  # list of (128,96)
-    # drum_bars = np.array(drum_bars, dtype=np.float32)  # (B,128,96) # change for wei-style nan and inf handling
-    drum_bars = np.nan_to_num(drum_bars, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    # drum_ssm = pairwise_euclidean_bar_ssm(drum_bars) # drum SSM (BxB)
-    # drum_ssm = minmax01(pad_to_256(drum_ssm)) # return max number, convert it to 256x256
-    # -- changed for wei-style nan and inf handling
-    drum_ssm = pairwise_euclidean_bar_ssm(drum_bars)
-    drum_ssm = np.nan_to_num(drum_ssm, nan=0.0, posinf=0.0, neginf=0.0)
+    drum_roll_bin = (mt.tracks[drum_idx].pianoroll > 0).astype(np.float32)
+
+    drum_bars_list = slice_bars(drum_roll_bin, bar_edges_steps, steps_per_bar=BAR_STEPS)  # list of (128,96)
+
+    # Defensive: ensure all bars are exactly (128,96) before stacking
+    for i, b in enumerate(drum_bars_list):
+        if b.shape != (128, BAR_STEPS):
+            raise ValueError(f"drum bar[{i}] shape {b.shape} != (128,{BAR_STEPS})")
+
+    drum_bars = np.stack(drum_bars_list, axis=0).astype(np.float32)  # (B,128,96)
+    np.nan_to_num(drum_bars, copy=False)  # one-time sanitize
+
+    drum_ssm = pairwise_euclidean_bar_ssm(drum_bars)  # (B,B)
+    # If you've never seen NaNs here, you can drop the next line:
+    # np.nan_to_num(drum_ssm, copy=False)
+
     drum_ssm = minmax01(pad_to_256(drum_ssm))
 
     # ------- Save pickles to the same names our trainer expects -------
@@ -910,17 +1028,19 @@ def prepare_dataset(limit=None):
 
     def has_cqt(stem: str) -> bool:
         return (OUT_CQT_POOL / f"{stem}_bars_cqt.npy").exists()
-
-    need_full  = [p for p in npz_files if p.stem not in already]                          # no pickles yet
-    need_cache = [p for p in npz_files if (p.stem in already) and (not has_cqt(p.stem))]  # pickles exist but cache missing
-
-    # process full ones first, then backfill caches
-    npz_files  = need_full + need_cache
     
-    # ---- pass 1: scan drum-onset counts; compute μ/σ; keep μ ± kσ ----
-    counts_map = {}
-    counts = []
-    for p in npz_files:
+    # NEW: clean intermediates even for stems we won't process this run
+    already_with_cache = {s for s in already if has_cqt(s)}
+    cleanup_intermediates_for_stems(already_with_cache)
+
+    # What needs doing?
+    need_full  = [p for p in npz_files if p.stem not in already]                    # no pickles yet
+    need_cache = [p for p in npz_files if (p.stem in already) and (not has_cqt(p.stem))]  # pickles exist, cache missing
+
+    # ---- pass 1: scan drum-onset counts across BOTH sets; compute μ/σ; keep μ ± kσ ----
+    pool_for_stats = need_full + need_cache
+    counts_map, counts = {}, []
+    for p in pool_for_stats:
         c = drum_onset_count_from_npz(p)
         if c is not None:
             counts_map[p] = c
@@ -928,56 +1048,74 @@ def prepare_dataset(limit=None):
 
     if len(counts) == 0:
         print("[clean] No songs with detectable drum track in this subset; nothing to prepare.")
-        npz_files = []
+        need_full, need_cache = [], []
     else:
         mu  = float(np.mean(counts))
         sig = float(np.std(counts))
         lo  = max(MIN_DRUM_ONSETS, int(np.floor(mu - DRUM_OUTLIER_SIGMA * sig)))
         hi  = int(np.ceil(mu + DRUM_OUTLIER_SIGMA * sig))
-        before = len(npz_files)
-        npz_files = [p for p in npz_files if (p in counts_map and lo <= counts_map[p] <= hi)]
-        print(f"[clean] drum-onset μ={mu:.1f} σ={sig:.1f} → keep in [{lo},{hi}] "
-              f"→ kept {len(npz_files)}/{before} ({before-len(npz_files)} filtered as outliers/empty)")
+        before_full, before_cache = len(need_full), len(need_cache)
+        need_full  = [p for p in need_full  if (p in counts_map and lo <= counts_map[p] <= hi)]
+        need_cache = [p for p in need_cache if (p in counts_map and lo <= counts_map[p] <= hi)]
+        print(f"[clean] μ={mu:.1f} σ={sig:.1f} keep[{lo},{hi}] → "
+              f"full {len(need_full)}/{before_full}, cache {len(need_cache)}/{before_cache}")
 
-
-    # --------------------------------------------------------
-
-    # # --- checking start ---
-    # print("[dbg] DATASET_ROOT:", DATASET_ROOT.resolve(), "exists:", DATASET_ROOT.exists())
-    # print("[dbg] total *.npz found:", len(npz_files))
-    # print("[dbg] first 5:", [str(p) for p in npz_files[:5]])
-
-    # # show sizes of first few
-    # for p in npz_files[:5]:
-    #     try:
-    #         sz = p.stat().st_size
-    #         print(f"[dbg] {p.name} -> {sz/1e6:.2f} MB")
-    #     except Exception as e:
-    #         print(f"[dbg] stat failed for {p}: {e}")
-    # # --- checking end ---
-
-    if limit is not None: #if there is limit on range of npz files, apply it
-        npz_files = npz_files[:limit]
+    # ---- honor --limit: fill FULL first, then CACHE with leftover ----
+    if limit is not None:
+        limit_full = min(limit, len(need_full))
+        need_full  = need_full[:limit_full]
+        left = max(0, limit - limit_full)
+        need_cache = need_cache[:left]
 
     meta = []
     n_ok = n_skip = n_err = 0
 
-    pbar = tqdm(npz_files, desc="[prep] songs", unit="song", dynamic_ncols=True)
+    # ---------- PASS A: full preparation ----------
+    if need_full:
+        pbar = tqdm(need_full, desc="[prep] songs (full)", unit="song", dynamic_ncols=True)
+        for p in pbar:
+            try:
+                info = prepare_one_song(p)  # full pipeline
+                if info is not None:
+                    meta.append(info); n_ok += 1
+                    pbar.set_postfix_str(f"ok={n_ok} last={p.stem[-8:]}")
+                else:
+                    n_skip += 1
+                    pbar.set_postfix_str(f"skipped={n_skip} last={p.stem[-8:]}")
+            except Exception as e:
+                n_err += 1
+                print(f"\n[ERROR] stem={p.stem} during prepare_one_song")
+                traceback.print_exc()
+                pbar.set_postfix_str(f"ERROR({n_err})={str(e)[:40]}")
+        pbar.close()
 
-    for i, p in enumerate(pbar, 1): #for each npz file, #used to be npz_files
-        try:
-            info = prepare_one_song(p)
-            if info is not None:
-                meta.append(info)
+    # ---------- PASS B: cache-only backfill ----------
+    if need_cache:
+        pbar = tqdm(need_cache, desc="[cache] backfill CQT", unit="song", dynamic_ncols=True)
+        for p in pbar:
+            try:
+                # cache-only: create bars_cqt.npy without touching pickles
+                info = prepare_one_song(p, only_cache_cqt=True)
+                # meta entry optional; we can still log it
+                meta.append(info or {"stem": p.stem, "cached_only": True})
                 n_ok += 1
-                # keep the console quiet; show status in tqdm instead of prints
                 pbar.set_postfix_str(f"ok={n_ok} last={p.stem[-8:]}")
-            else:
-                n_skip += 1
-                pbar.set_postfix_str(f"skipped={n_skip} last={p.stem[-8:]}")
-        except Exception as e:
-            n_err += 1
-            pbar.set_postfix_str(f"ERROR({n_err})={str(e)[:40]}")
+            except Exception as e:
+                n_err += 1
+                print(f"\n[ERROR] stem={p.stem} during prepare_one_song")
+                traceback.print_exc()
+                pbar.set_postfix_str(f"ERROR({n_err})={str(e)[:40]}")
+        pbar.close()
+    
+    # NEW: final sweep in case anything slipped through
+    if not KEEP_WAV:
+        for p in OUT_WAV_ND.glob("*.wav"):
+            safe_unlink(p)
+    if not KEEP_MIDI:
+        for d in (OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO):
+            for p in d.glob("*.mid"):
+                safe_unlink(p)
+    prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
 
     if WRITE_META:
         ensure_dir(OUT_OBJ_PKL)
@@ -986,7 +1124,6 @@ def prepare_dataset(limit=None):
         print(f"[prep] done. saved meta with {len(meta)} items.")
     else:
         print(f"[prep] done. processed {len(meta)} items (meta file skipped).")
-
 
 
 # -------------------------
@@ -1489,8 +1626,8 @@ if __name__ == "__main__":
         BETA2 = args.beta2
     
     configure_paths()
-    print(f"[paths] DATASET_ROOT={DATASET_ROOT}")
-    print(f"[paths] OUT_PRE={OUT_PRE}")
+    print(f"[paths] OUT_PRE={OUT_PRE.resolve()}")
+    print(f"[cfg] KEEP_WAV={KEEP_WAV} KEEP_MIDI={KEEP_MIDI}")
 
 
     # pass limit into prepare if needed
