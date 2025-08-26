@@ -43,13 +43,13 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 # Paths will be (re)configured below; these are defaults if not overridden
 PROJECT_DIR   = Path.cwd()
 DATASET_ROOT  = Path("/data")    # directory that contains LPD-5 *.npz
-OUT_PRE       = None             # will be set by configure_paths()
 OUT_WAV_ND    = None
 OUT_DRUM_SSM  = None
 OUT_MEL_SSM   = None
-OUT_CQT_POOL  = None
 CKPT_DIR      = PROJECT_DIR / "checkpoints" / "drum_generator"
 LOG_DIR       = PROJECT_DIR / "logs"
+OUT_PRE = Path(DATASET_ROOT) / "pre_processed_data"
+OUT_CQT_POOL = OUT_PRE / "cqt_pooled_data"   # <-- matches train_ssm_generator output
 
 # Audio / CQT parameters (per Wei §3.1)
 SR = 44100
@@ -316,10 +316,15 @@ class DrumGenDataset(Dataset):
         for stem, npz in tqdm(list(stems.items()), desc="[dataset] scan songs", unit="song"):
             wav_path = load_no_drum_wav_path(stem)               # /data/pre_processed_data/proc_no_drum_wav/{stem}_no_drum.wav
             ssm_path = load_drum_ssm_path(stem)                  # /data/pre_processed_data/bar_level_drum_ssm/song_barlv_drum_ssm_{stem}.pkl
+            cqt_npy = OUT_CQT_POOL / f"{stem}_bars_cqt.npy"
 
-            if ssm_path.exists() and (wav_path.exists() or not self.require_wav):
+            has_ssm = ssm_path.exists()
+            has_cqt = cqt_npy.exists()
+            has_wav = (wav_path is not None) and Path(wav_path).exists()
+
+            if has_ssm and (has_cqt):
                 # store None for wav if it doesn't exist so __getitem__ can branch safely
-                samples.append((stem, npz, wav_path if wav_path.exists() else None, ssm_path))
+                samples.append((stem, npz, wav_path if has_wav else None, ssm_path))
 
         if limit_songs is not None:
             samples = samples[:limit_songs]
@@ -366,21 +371,16 @@ class DrumGenDataset(Dataset):
         # bar edges (seconds)
         bar_grids = compute_bar_grid_seconds(mt)
 
-        # Load / compute CQT pooled bars
-        if self.cache_cqt_to_disk:
-            npy_path = OUT_CQT_POOL / f"{stem}_bars_cqt.npy"
-            if npy_path.exists():
-                bars_cqt = np.load(npy_path)  # (B,84,96)
-            else:
-                y, sr = librosa.load(str(wav), sr=SR, mono=True)
-                bars_cqt = compute_cqt_pooled(y, sr, bar_grids)  # (B,84,96)
-                try:
-                    np.save(npy_path, bars_cqt)
-                except Exception:
-                    pass
-        else:
-            y, sr = librosa.load(str(wav), sr=SR, mono=True)
-            bars_cqt = compute_cqt_pooled(y, sr, bar_grids)
+        # Load precomputed bar CQTs from SSM stage (no WAV fallback)
+        npy_path = OUT_CQT_POOL / f"{stem}_bars_cqt.npy"
+        if not npy_path.exists():
+            raise FileNotFoundError(
+                f"Missing bar-level CQT cache for stem {stem}: {npy_path}\n"
+                "Run train_ssm_generator.py first to export bar CQTs to cqt_pooled_data."
+            )
+        bars_cqt = np.load(npy_path).astype(np.float32)  # (B,84,96), float32 in [0,1]
+        if bars_cqt.ndim != 3 or bars_cqt.shape[1:] != (84, 96):
+            raise ValueError(f"Unexpected CQT shape {bars_cqt.shape} for {npy_path}")
 
         # Load drum SSM and unpad to BxB
         with open(ssm_p, "rb") as f:
