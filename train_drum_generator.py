@@ -313,7 +313,7 @@ class DrumGenDataset(Dataset):
         stems = {p.stem: p for p in npzs}
 
         samples = []
-        for stem, npz in stems.items():
+        for stem, npz in tqdm(list(stems.items()), desc="[dataset] scan songs", unit="song"):
             wav_path = load_no_drum_wav_path(stem)               # /data/pre_processed_data/proc_no_drum_wav/{stem}_no_drum.wav
             ssm_path = load_drum_ssm_path(stem)                  # /data/pre_processed_data/bar_level_drum_ssm/song_barlv_drum_ssm_{stem}.pkl
 
@@ -330,7 +330,7 @@ class DrumGenDataset(Dataset):
         self.index = []       # (song_idx, bar_idx)
         self.song_meta = []   # per-song cache: {"stem", "res", "B"}
 
-        for si, (stem, npz, wav, ssm_p) in enumerate(self.songs):
+        for si, (stem, npz, wav, ssm_p) in enumerate(tqdm(self.songs, desc="[dataset] index bars", unit="song")):
             # Determine bar count B from NPZ downbeats (robust)
             mt = ppr.load(str(npz))
             res = int(getattr(mt, "beat_resolution", 24))
@@ -566,7 +566,8 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
         val_sums = {"loss":0.0, "rec":0.0, "kl":0.0, "c":0.0}
         vnb = 0
         with torch.no_grad():
-            for X, Yimg, c in val_loader:
+            vbar = tqdm(val_loader, desc=f"[val   ep{epoch:03d}]", leave=False)
+            for X, Yimg, c in vbar:
                 vnb += 1
                 X = X.to(DEVICE, non_blocking=True)
                 Yimg = Yimg.to(DEVICE, non_blocking=True)
@@ -580,6 +581,10 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
                 val_sums["rec"]  += loss_rec.item()
                 val_sums["kl"]   += loss_kl.item()
                 val_sums["c"]    += loss_c.item()
+                vbar.set_postfix(loss=f"{val_sums['loss']/vnb:.3f}",
+                         rec=f"{val_sums['rec']/vnb:.3f}",
+                         kl=f"{val_sums['kl']/vnb:.3f}",
+                         c=f"{val_sums['c']/vnb:.3f}")
 
         secs = time.time() - t0
         tr_loss = sums["loss"]/max(1,nb)
