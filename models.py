@@ -139,36 +139,42 @@ class SSMDiscriminator(nn.Module):
 
 class DrumEncoder(nn.Module):
     """
-    Encodes an 84×96×8 bar-selection tensor into a 32-dim latent vector and note density.
-    Implements: 8 conv layers ↓, 3 FC + skip, then mu/logvar and c_hat.
+    Encodes an 8×84×96 bar-stack into a 32-dim latent vector and a note-density scalar.
+    We use 5 downsampling conv blocks (not 8) for 84×96, then AdaptiveAvgPool to 1×1
+    so the FC stack always sees a fixed-size vector.
     """
-    def __init__(self, in_channels=8, base_channels=64, latent_dim=32):
+    def __init__(self, in_channels=8, base_channels=64, latent_dim=32, n_down=5):
         super().__init__()
-        # Conv stack
+        assert n_down >= 1 and n_down <= 6, "n_down should be 1..6 for 84×96 inputs"
         conv_layers = []
         curr_ch = in_channels
-        for i in range(8):
-            out_ch = base_channels * min(2**i, 8)
+        for i in range(n_down):
+            out_ch = base_channels * min(2**i, 8)  # 64,128,256,512,512...
             conv_layers += [
-                nn.Conv2d(curr_ch, out_ch, 4, 2, 1),
+                nn.Conv2d(curr_ch, out_ch, kernel_size=4, stride=2, padding=1),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=True),
             ]
             curr_ch = out_ch
         self.conv = nn.Sequential(*conv_layers)
-        # FC layers + skip
+        # collapse any remaining 2×3 (or similar) to 1×1 so the FCs match the SSM style
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+        # FC stack + skip (mirrors your style)
         self.fc1 = nn.Linear(curr_ch, 1024)
         self.fc2 = nn.Linear(1024, 1024)
         self.fc3 = nn.Linear(1024, 512)
-        # latent & density heads
+
+        # latent & note-density heads
         self.fc_mu     = nn.Linear(512, latent_dim)
         self.fc_logvar = nn.Linear(512, latent_dim)
-        self.fc_c_hat  = nn.Linear(512, 1)  # note density estimate
+        self.fc_c_hat  = nn.Linear(512, 1)
 
     def forward(self, x):
-        x = self.conv(x).flatten(1)
+        x = self.conv(x)          # (B, C, H', W') with H'≈2, W'≈3 for 84×96 after 5 downs
+        x = self.gap(x).flatten(1)  # (B, C)
         h1 = F.relu(self.fc1(x))
-        h2 = F.relu(self.fc2(h1) + h1)
+        h2 = F.relu(self.fc2(h1) + h1)  # skip
         h3 = F.relu(self.fc3(h2))
         mu     = self.fc_mu(h3)
         logvar = self.fc_logvar(h3)
@@ -179,34 +185,43 @@ class DrumEncoder(nn.Module):
 class DrumDecoder(nn.Module):
     """
     Decodes (z, c_hat) into a 46×16×1 drum pattern.
-    Reverse of encoder: 3 FC + skip, then 8 deconv.
+    3 FC layers with a projection-skip on the 512→1024 step, then deconvs.
     """
     def __init__(self, out_channels=1, base_channels=64, latent_dim=32):
         super().__init__()
-        # input dimension = latent_dim + 1 (for c_hat)
+        # input = [z, c_hat]
         in_dim = latent_dim + 1
-        # FC reverse
-        self.fc3 = nn.Linear(in_dim, 512)
-        self.fc2 = nn.Linear(512, 1024)
-        self.fc1 = nn.Linear(1024, base_channels * 8)
-        # Deconv stack
+
+        # FC reverse stack
+        self.fc3 = nn.Linear(in_dim, 512)      # (B, 512)
+        self.fc2 = nn.Linear(512, 1024)        # (B, 1024)
+        self.skip_h3 = nn.Linear(512, 1024, bias=False)  # projection for residual
+        self.fc1 = nn.Linear(1024, base_channels * 8)    # (B, base*8)
+
+        # Deconv stack (unchanged)
         deconv_layers = []
         curr_ch = base_channels * 8
         for i in reversed(range(8)):
-            out_ch = base_channels * min(2**(i-1), 8) if i>0 else out_channels
+            out_ch = base_channels * min(2**(i-1), 8) if i > 0 else out_channels
             block = [nn.ConvTranspose2d(curr_ch, out_ch, 4, 2, 1)]
-            block += [nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)] if i>0 else [nn.Sigmoid()]
+            block += [nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)] if i > 0 else [nn.Sigmoid()]
             deconv_layers += block
             curr_ch = out_ch
         self.deconv = nn.Sequential(*deconv_layers)
 
     def forward(self, z, c_hat):
-        x = torch.cat([z, c_hat], dim=1)
-        h3 = F.relu(self.fc3(x))
-        h2 = F.relu(self.fc2(h3) + h3)
-        h1 = F.relu(self.fc1(h2))
-        x = h1.view(h1.size(0), -1, 1, 1)
-        return self.deconv(x)
+        # concat latent and density
+        x = torch.cat([z, c_hat], dim=1)   # (B, latent_dim+1)
+        h3 = F.relu(self.fc3(x))           # (B, 512)
+
+        # projection skip to match 1024 before addition
+        h2 = F.relu(self.fc2(h3) + self.skip_h3(h3))  # (B, 1024)
+
+        h1 = F.relu(self.fc1(h2))          # (B, base*8)
+
+        # reshape to feature map for deconvs
+        x = h1.view(h1.size(0), -1, 1, 1)  # (B, base*8, 1, 1)
+        return self.deconv(x)              # expected (B, 1, 46, 16)
 
 
 class DrumVAE(nn.Module):
