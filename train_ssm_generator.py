@@ -693,83 +693,86 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     # print(f"[dbg] T (max time steps across tracks) = {T}")
     # end: end of check
 
-    ## Fixed downbeat calculation
-    pmidi = mt.to_pretty_midi()
 
-    # 3a) get raw downbeats (or synthesize from beats if missing), then fix by note density
-    downbeats_raw_sec = get_downbeats_raw(pmidi)
-    if len(downbeats_raw_sec) < 2:
-        print("[warn] not enough downbeats; skipping song.")
-        return None
+    # ## Fixed downbeat calculation -- is it really ok to delete this...?
+    # pmidi = mt.to_pretty_midi()
 
-    fix = fix_downbeats_by_note_density(pmidi, downbeats_raw_sec, bar_portion=BAR_STEPS)
-    downbeats_sec = fix["downbeats_fixed"]                  # seconds
-    if downbeats_sec.size < 2:
-        print("[warn] fixed downbeats too few; skipping song.")
-        return None
+    # # 3a) get raw downbeats (or synthesize from beats if missing), then fix by note density
+    # downbeats_raw_sec = get_downbeats_raw(pmidi)
+    # if len(downbeats_raw_sec) < 2:
+    #     print("[warn] not enough downbeats; skipping song.")
+    #     return None
 
-    # 3b) convert those seconds to step indices (because your drum pianoroll is in steps)
-    sec_per_quarter = 60.0 / TEMPO_QPM                      # normalized tempo
-    sec_per_step    = sec_per_quarter / resolution          # e.g., 0.5/24 ≈ 0.020833 s
-    bar_edges_steps = np.clip(
-        np.round(downbeats_sec / sec_per_step).astype(int),
-        0, max(0, T-1)
-    ).tolist()
+    # fix = fix_downbeats_by_note_density(pmidi, downbeats_raw_sec, bar_portion=BAR_STEPS)
+    # downbeats_sec = fix["downbeats_fixed"]                  # seconds
+    # if downbeats_sec.size < 2:
+    #     print("[warn] fixed downbeats too few; skipping song.")
+    #     return None
 
-    # Delete: need to patch downbeat assignment to boolean
-    # # 3c) synthesize a 1-D downbeat vector 'db' of length T (for legacy code that expects it)
-    # db = np.zeros(T, dtype=np.uint8)
-    # db[np.array(bar_edges_steps, dtype=int)] = 1 #added this to set it as 1D
-    # if len(bar_edges_steps) > 0:
-    #     db[np.array(bar_edges_steps, dtype=int)] = 1
+    # # 3b) convert those seconds to step indices (because your drum pianoroll is in steps)
+    # sec_per_quarter = 60.0 / TEMPO_QPM                      # normalized tempo
+    # sec_per_step    = sec_per_quarter / resolution          # e.g., 0.5/24 ≈ 0.020833 s
+    # bar_edges_steps = np.clip(
+    #     np.round(downbeats_sec / sec_per_step).astype(int),
+    #     0, max(0, T-1)
+    # ).tolist()
 
-    # Synthesize a 1-D boolean downbeat vector: True at bar starts
-    idx = np.asarray(bar_edges_steps, dtype=int)
-    idx = idx[(idx >= 0) & (idx < T)]           # safety clipping
+    # # Delete: need to patch downbeat assignment to boolean
+    # # # 3c) synthesize a 1-D downbeat vector 'db' of length T (for legacy code that expects it)
+    # # db = np.zeros(T, dtype=np.uint8)
+    # # db[np.array(bar_edges_steps, dtype=int)] = 1 #added this to set it as 1D
+    # # if len(bar_edges_steps) > 0:
+    # #     db[np.array(bar_edges_steps, dtype=int)] = 1
 
-    db = np.zeros(T, dtype=np.bool_)            # ← bool, not uint8/int
-    db[idx] = True
-    mt.downbeat = db                            # pypianoroll expects bool (T,)
+    # # Synthesize a 1-D boolean downbeat vector: True at bar starts
+    # idx = np.asarray(bar_edges_steps, dtype=int)
+    # idx = idx[(idx >= 0) & (idx < T)]           # safety clipping
 
-    # (Optional) keep mt.downbeat consistent for any later code that still reads it
-    # shape should be (T,1) in pypianoroll
-    # mt.downbeat = db[:, None]
-    mt.downbeat = db #added this to set it as 1D
+    # db = np.zeros(T, dtype=np.bool_)            # ← bool, not uint8/int
+    # db[idx] = True
+    # mt.downbeat = db                            # pypianoroll expects bool (T,)
 
-    # 3d) debug info similar to your old prints
-    print(f"[dbg] synthesized db.shape={db.shape}, #ones={int(db.sum())}, first8_idxs={bar_edges_steps[:8]}")
-    print(f"[dbg] basic_time_unit={fix['basic_time_unit']:.6f}s, est_tempo≈{estimate_global_tempo(pmidi):.2f} bpm")
-    print("downbeats (steps) =", len(bar_edges_steps))
+    # # (Optional) keep mt.downbeat consistent for any later code that still reads it
+    # # shape should be (T,1) in pypianoroll
+    # # mt.downbeat = db[:, None]
+    # mt.downbeat = db #added this to set it as 1D
 
-    # Also keep the seconds-based edges for your audio CQT pooling later:
-    bar_edges_sec = downbeats_sec.tolist()
+    # # 3d) debug info similar to your old prints
+    # print(f"[dbg] synthesized db.shape={db.shape}, #ones={int(db.sum())}, first8_idxs={bar_edges_steps[:8]}")
+    # print(f"[dbg] basic_time_unit={fix['basic_time_unit']:.6f}s, est_tempo≈{estimate_global_tempo(pmidi):.2f} bpm")
+    # print("downbeats (steps) =", len(bar_edges_steps))
 
-    ## end: end of fix
+    # # Also keep the seconds-based edges for your audio CQT pooling later:
+    # bar_edges_sec = downbeats_sec.tolist()
 
-    db_idx = np.where(db > 0)[0]
-    print(f"[dbg] #downbeats={len(db_idx)}  first8={db_idx[:8]}")
+    # ## end: end of fix
 
-    tempo = getattr(mt, "tempo", None)
-    # if tempo is not None:
-    #     print(f"[dbg] tempo.shape={tempo.shape}  example first3={tempo[:3].ravel() if len(tempo)>0 else tempo}")
-    # else:
-    #     print("[dbg] tempo not present on this Multitrack (ok; we normalize later).")
+    # db_idx = np.where(db > 0)[0]
+    # print(f"[dbg] #downbeats={len(db_idx)}  first8={db_idx[:8]}")
 
-    # 4) Drum track present?
-    drum_idx = next((i for i,tr in enumerate(mt.tracks) if getattr(tr, "is_drum", False)), None)
-    # print(f"[dbg] drum_idx={drum_idx}")
-    assert drum_idx is not None, "No drum track found (this song will be skipped)."
+    # tempo = getattr(mt, "tempo", None)
+    # # if tempo is not None:
+    # #     print(f"[dbg] tempo.shape={tempo.shape}  example first3={tempo[:3].ravel() if len(tempo)>0 else tempo}")
+    # # else:
+    # #     print("[dbg] tempo not present on this Multitrack (ok; we normalize later).")
 
-    drum_roll = mt.tracks[drum_idx].pianoroll
-    # print(f"[dbg] drum pianoroll shape={None if drum_roll is None else drum_roll.shape}")
+    # # 4) Drum track present?
+    # drum_idx = next((i for i,tr in enumerate(mt.tracks) if getattr(tr, "is_drum", False)), None)
+    # # print(f"[dbg] drum_idx={drum_idx}")
+    # assert drum_idx is not None, "No drum track found (this song will be skipped)."
 
-    # 5) Quick per-bar width check using your get_downbeat_indices()
-    bar_edges_steps = [i for i in range(len(db)) if db[i]]
-    print(f"[dbg] bars (by downbeats) = {len(bar_edges_steps)-1 if len(bar_edges_steps)>1 else 0}")
-    if len(bar_edges_steps) >= 2:
-        w0 = bar_edges_steps[1] - bar_edges_steps[0]
-        print(f"[dbg] first bar width in steps = {w0}  (expected ~ {steps_per_bar})")
-    # --- checking end ---
+    # drum_roll = mt.tracks[drum_idx].pianoroll
+    # # print(f"[dbg] drum pianoroll shape={None if drum_roll is None else drum_roll.shape}")
+
+    # # 5) Quick per-bar width check using your get_downbeat_indices()
+    # bar_edges_steps = [i for i in range(len(db)) if db[i]]
+    # print(f"[dbg] bars (by downbeats) = {len(bar_edges_steps)-1 if len(bar_edges_steps)>1 else 0}")
+    # if len(bar_edges_steps) >= 2:
+    #     w0 = bar_edges_steps[1] - bar_edges_steps[0]
+    #     print(f"[dbg] first bar width in steps = {w0}  (expected ~ {steps_per_bar})")
+    # # --- checking end --- is it really ok to delete this...?
+
+
 
     # resolution = int(mt.beat_resolution)      # steps per quarter (LPD default 24 fits 96 per bar)  :contentReference[oaicite:4]{index=4}
 
@@ -810,21 +813,35 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     bar_edges_steps = [int(round(t / sec_per_step)) for t in downbeats_sec]
     ## end: end of downbeat calculation
 
+    # make 1-D boolean downbeat of length T (after normalization)
+    T = multitrack_max_length_steps(mt)
+    db = np.zeros(T, dtype=np.bool_)
+    idx = np.asarray(bar_edges_steps, dtype=int)
+    idx = idx[(idx >= 0) & (idx < T)]
+    db[idx] = True
+    mt.downbeat = db
+
+    # handy alias used later
+    bar_edges_sec = downbeats_sec
+
+
     # Normalize shapes so pypianoroll.write() won't complain
     mt = fix_multitrack_for_write(mt, bar_edges_steps, TEMPO_QPM)
 
     # --- Write three MIDI variants (single, safe block) ---
     stem = npz_path.stem
-    midi_all = OUT_MIDI_ALL / f"{stem}_all_tracks.mid"
+    # midi_all = OUT_MIDI_ALL / f"{stem}_all_tracks.mid"
     midi_nd  = OUT_MIDI_ND  / f"{stem}_no_drum.mid"
-    midi_do  = OUT_MIDI_DO  / f"{stem}_drum_only.mid"
-    ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do)
+    # midi_do  = OUT_MIDI_DO  / f"{stem}_drum_only.mid"
+    # ensure_dir(midi_all); ensure_dir(midi_nd); ensure_dir(midi_do)
+    ensure_dir(midi_nd)
+    # ensure_ppr_shapes(mt)
 
-    # Ensure base mt has 1-D numpy arrays
-    mt.tempo    = np.asarray(mt.tempo,    dtype=np.float32).reshape(-1)
-    mt.downbeat = np.asarray(mt.downbeat, dtype=bool).reshape(-1)
-    assert_mt_ok(mt, "pre-write:all")
-    ppr.write(mt, str(midi_all))
+    # # Ensure base mt has 1-D numpy arrays
+    # mt.tempo    = np.asarray(mt.tempo,    dtype=np.float32).reshape(-1)
+    # mt.downbeat = np.asarray(mt.downbeat, dtype=bool).reshape(-1)
+    # assert_mt_ok(mt, "pre-write:all")
+    # ppr.write(mt, str(midi_all))
 
     # No-drum copy
     mt_nd = mt.copy()
@@ -835,15 +852,15 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     assert_mt_ok(mt_nd, "pre-write:no-drum")
     ppr.write(mt_nd, str(midi_nd))
 
-    # Drum-only copy
-    mt_do = mt.copy()
-    for i, tr in enumerate(mt_do.tracks):
-        if i != drum_idx:
-            tr.pianoroll[:] = 0
-    mt_do.tempo    = mt.tempo.copy()
-    mt_do.downbeat = mt.downbeat.copy()
-    assert_mt_ok(mt_do, "pre-write:drum-only")
-    ppr.write(mt_do, str(midi_do))
+    # # Drum-only copy
+    # mt_do = mt.copy()
+    # for i, tr in enumerate(mt_do.tracks):
+    #     if i != drum_idx:
+    #         tr.pianoroll[:] = 0
+    # mt_do.tempo    = mt.tempo.copy()
+    # mt_do.downbeat = mt.downbeat.copy()
+    # assert_mt_ok(mt_do, "pre-write:drum-only")
+    # ppr.write(mt_do, str(midi_do))
 
 
     # Render no-drum to WAV (CQT input)
@@ -932,9 +949,9 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         if not KEEP_WAV:
             safe_unlink(wav_nd)
         if not KEEP_MIDI:
-            safe_unlink(midi_all)
+            #safe_unlink(midi_all)
             safe_unlink(midi_nd)
-            safe_unlink(midi_do)
+            #safe_unlink(midi_do)
         prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
         return {"stem": stem, "bars": int(B), "cached_only": True}
 
@@ -982,9 +999,9 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         safe_unlink(wav_nd)  # delete rendered WAV once we've extracted features
 
     if not KEEP_MIDI:
-        safe_unlink(midi_all)
+        #safe_unlink(midi_all)
         safe_unlink(midi_nd)
-        safe_unlink(midi_do)
+        #safe_unlink(midi_do)
     
     # Optionally prune now-empty folders (harmless if not empty)
     prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
@@ -993,9 +1010,9 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
     # Only saving what we need now
     return {
         "stem": stem,
-        "midi_all": str(midi_all),
+       #"midi_all": str(midi_all),
         "midi_nd": str(midi_nd),
-        "midi_do": str(midi_do),
+        #"midi_do": str(midi_do),
         "wav_nd": str(wav_nd),
         "bars": len(drum_bars)
     }
