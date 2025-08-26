@@ -1274,10 +1274,10 @@ def train_ssm(limit=None):
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(SEED))
 
     # --- after you compute train_set, val_set ---
-    train_bs = max(1, min(BATCH_SIZE, len(train_set)))
+    train_bs = max(2, min(BATCH_SIZE, len(train_set)))
     val_bs   = max(1, min(BATCH_SIZE, len(val_set)))  # avoid 0
 
-    train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=2, drop_last=False)
+    train_loader = DataLoader(train_set, batch_size=train_bs, shuffle=True, num_workers=2, drop_last=True)
     val_loader   = DataLoader(val_set,   batch_size=val_bs, shuffle=False, num_workers=2, drop_last=False)
 
     # === DEBUG: dataset/batch sizes & one-batch probe ===
@@ -1366,6 +1366,9 @@ def train_ssm(limit=None):
         )
 
         for mel, drm in pbar:  # for every (mel ssm, drum ssm) pair,
+            if mel.size(0) < 2:
+                # Avoid BatchNorm crash on tiny batch
+                continue
             num_batches += 1
             mel, drm = mel.to(DEVICE), drm.to(DEVICE)  # move to GPU/CPU as needed
 
