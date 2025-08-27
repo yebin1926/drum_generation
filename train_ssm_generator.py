@@ -33,7 +33,6 @@ from typing import Optional
 import traceback
 import copy
 
-
 # -------------------------
 # Config (paths, seeds, hyperparams)
 # -------------------------
@@ -834,10 +833,29 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         if y.ndim == 2:
             y = y.mean(axis=1)
         y = y.astype(np.float32, copy=False)
+         # ---- guard: empty or silent after removing drums → skip ----
+        if y.size == 0 or float(np.max(np.abs(y))) == 0.0:
+            msg = f"[skip] {stem}: no-drum audio empty/silent; skipping CQT."
+            print(msg)
+            if only_cache_cqt:
+                # cache-only pass → just report and bail
+                prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
+                return {"stem": stem, "bars": 0, "cached_only": True, "skipped": "silent_nodrum"}
+            else:
+                # full pipeline → we can’t build a meaningful Mel-SSM; skip this song
+                return None
 
         # ------- CQT -------
         dur = len(y) / SR
-        cqt = librosa.cqt(y, sr=SR, hop_length=HOP, n_bins=N_BINS, bins_per_octave=12)
+        try:
+            cqt = librosa.cqt(y, sr=SR, hop_length=HOP, n_bins=N_BINS, bins_per_octave=12)
+        except librosa.util.exceptions.ParameterError as e:
+            print(f"[skip] {stem}: CQT failed ({e}); skipping.")
+            if only_cache_cqt:
+                prune_empty_dirs(OUT_WAV_ND, OUT_MIDI_ALL, OUT_MIDI_ND, OUT_MIDI_DO)
+                return {"stem": stem, "bars": 0, "cached_only": True, "skipped": "cqt_too_short"}
+            else:
+                return None
         cqt_db = librosa.amplitude_to_db(np.abs(cqt), ref=np.max)
         cqt_db = np.clip(np.nan_to_num(cqt_db, neginf=-120.0, posinf=0.0), -120.0, 0.0).astype(np.float32)
 
@@ -852,9 +870,14 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         mask = f1 <= f0
         f1[mask] = np.minimum(f0[mask] + 1, n_frames)
 
+        # cum = np.concatenate([np.zeros((N_BINS, 1), dtype=np.float32),
+        #                     np.cumsum(cqt_db, axis=1)], axis=1)
+        # sums = np.take(cum, f1 + 1, axis=1) - np.take(cum, f0 + 1, axis=1)  # (84, B, 96)
+        # NEW (correct):
         cum = np.concatenate([np.zeros((N_BINS, 1), dtype=np.float32),
-                            np.cumsum(cqt_db, axis=1)], axis=1)
-        sums = np.take(cum, f1 + 1, axis=1) - np.take(cum, f0 + 1, axis=1)  # (84, B, 96)
+                            np.cumsum(cqt_db, axis=1)], axis=1)  # shape (84, n_frames+1)
+        # Use [a,b) sum = cum[:, b] - cum[:, a]; a ∈ [0,n_frames-1], b ∈ [1,n_frames]
+        sums = np.take(cum, f1, axis=1) - np.take(cum, f0, axis=1)
         means = sums / (f1 - f0)[None, :, :].astype(np.float32)
         bars_cqt = np.transpose(means, (1, 0, 2)).astype(np.float32)
         bars_cqt = np.nan_to_num(bars_cqt, nan=0.0, posinf=0.0, neginf=0.0)
@@ -958,7 +981,7 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         ret["wav_nd"] = str(wav_nd)
     return ret
 
-def prepare_dataset(limit=None):
+def prepare_dataset(limit=None, cache_limit = None):
 
     if OUT_PRE is None or OUT_MEL_SSM is None or OUT_DRUM_SSM is None \
        or OUT_MIDI_ALL is None or OUT_MIDI_ND is None or OUT_MIDI_DO is None \
@@ -1025,10 +1048,15 @@ def prepare_dataset(limit=None):
         left = max(0, limit - limit_full)
         need_cache = need_cache[:left]
 
+    # ---- hard cap PASS B regardless of --limit ----
+    if cache_limit is not None:
+        need_cache = need_cache[:cache_limit]
+
+    print(f"[prep] plan → PASS A (full): {len(need_full)} | PASS B (cache): {len(need_cache)}")
+
     meta = []
     n_ok = n_skip = n_err = 0
-
-    # ---------- PASS A: full preparation ----------
+    # ---------- PASS A: full preparation ----------/
     if need_full:
         pbar = tqdm(need_full, desc="[prep] songs (full)", unit="song", dynamic_ncols=True)
         for p in pbar:
@@ -1048,6 +1076,8 @@ def prepare_dataset(limit=None):
         pbar.close()
 
     # ---------- PASS B: cache-only backfill ----------
+    MAX_CACHE = 20
+    need_cache = need_cache[:MAX_CACHE]
     if need_cache:
         pbar = tqdm(need_cache, desc="[cache] backfill CQT", unit="song", dynamic_ncols=True)
         for p in pbar:
@@ -1176,7 +1206,7 @@ def save_sample_png(epoch, stem, mel, drm, recon):
     plt.close(fig)
 
 
-def train_ssm(limit=None):
+def train_ssm(limit=None, cache_limit=None):
     if OUT_PRE is None or OUT_MEL_SSM is None or OUT_DRUM_SSM is None \
        or OUT_MIDI_ALL is None or OUT_MIDI_ND is None or OUT_MIDI_DO is None \
        or OUT_WAV_ND is None:
@@ -1565,6 +1595,8 @@ if __name__ == "__main__":
     ap.add_argument("--lrD", type=float, default=None, help="Adam LR for discriminator")
     ap.add_argument("--beta1", type=float, default=None, help="Adam beta1")
     ap.add_argument("--beta2", type=float, default=None, help="Adam beta2")
+    ap.add_argument("--cache_limit", type=int, default=None,
+                help="cap #songs to backfill CQT cache in PASS B")
     args = ap.parse_args()
 
     # Override globals if flags provided
@@ -1602,4 +1634,4 @@ if __name__ == "__main__":
 
     #    train_ssm() 
 
-    train_ssm(limit=args.limit) # delete
+    train_ssm(limit=args.limit, cache_limit=args.cache_limit) # delete
