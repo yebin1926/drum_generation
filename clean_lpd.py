@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-clean_lpd.py
+clean_lpd_wei.py
 
-Clean the LPD dataset following Wei et al. (2019):
+Cleans LPD songs following Wei et al. (2019):
 
- 1) Remove songs with inconsistent duration after synthesis.
-    (Fast defaults avoid real audio rendering; you can enable true synthesis.)
- 2) Remove songs with empty/noisy drum tracks (drum-note counts outside mean ± 2*std).
- 3) Apply 16th-beat quantization on the drum track (keep notes on or near 16th grid).
+  Step 1) Remove songs with inconsistent duration after synthesis.
+          (Default uses a fast symbolic check; 'synth' is slower but exact.)
+  Step 2) Remove songs with empty/noisy drum tracks:
+          compute drum-note counts over *survivors of Step 1*,
+          then drop songs outside mean ± 2 * std.
+  Step 3) Apply 16th-beat quantization on drum tracks:
+          snap notes to the nearest 16th and remove only those that would
+          be shifted too far (outside a small tolerance window).
 
-Implementation notes:
-- Robust NPZ loader handles multiple on-disk layouts; falls back to reconstructing a
-  pypianoroll.Multitrack from arrays when ppr.load() fails.
-- Pass 0 (count drum notes) is parallelized with ProcessPoolExecutor.
-- Resume-friendly: writes manifests (kept/trash) so you can re-run without redoing work.
-- Optional writing of ".clean.npz" per kept song (off by default to reduce I/O).
+Implementation notes
+- Robust loader handles multiple .npz layouts and returns a pypianoroll.Multitrack.
+- Pass 1 runs in parallel: we check duration, count drums, bars, and off-grid%.
+- Pass 2 computes mean±2σ on the kept candidates from Step 1 (paper order).
+- Quantization *modifies notes*, not songs. (Optionally drop songs with high off-grid% if you want stricter filtering.)
+- Resume-friendly manifests avoid reprocessing: lpd_manifest_kept.txt / lpd_manifest_trash.txt
+- Optional writing of "<stem>.clean.npz" for quantized copies (off by default).
 
-Default paths assume:
-  --data_root /data
-  NPZ files under /data/lpd
-  SoundFont at /workspace/sound_front_lib.sf2 (can override via $SOUNDFONT).
+Typical usage (fast, recommended):
+  python3 clean_lpd_wei.py --data_root /data --duration_check symbolic --workers 16
 
-Example (fast, recommended):
-  python3 clean_lpd.py --data_root /data --duration_check symbolic --workers 16 --write_clean 0
-
-Exact Wei-style check (slow: does fluidsynth render):
-  python3 clean_lpd.py --data_root /data --duration_check synth --workers 4 --write_clean 1
+Slower, exact audio duration check (requires fluidsynth + SoundFont):
+  python3 clean_lpd_wei.py --data_root /data --duration_check synth --workers 4 --write_clean 1
 """
 
 import os
@@ -50,38 +50,37 @@ import pypianoroll as ppr   # LPD NPZ <-> Multitrack
 import librosa              # audio duration fallback
 import soundfile as sf      # audio duration (fast)
 
+
 # -------------------------
 # Config (paths & constants)
 # -------------------------
 
-# DATA ROOT (contains lpd/ and data_trash/)
 DEFAULT_DATA_ROOT = "/data"
-
-# Where LPD npz live (under data_root)
 LPD_SUBDIR   = "lpd"
 TRASH_SUBDIR = "data_trash"
 
-# SoundFont configuration
-DEFAULT_SF2 = "/workspace/sound_front_lib.sf2"  # your fixed path
+DEFAULT_SF2 = "/workspace/sound_front_lib.sf2"
 SOUND_FONT  = Path(os.environ.get("SOUNDFONT", DEFAULT_SF2))
 
-# Synthesis & timing
 SR = 44100
-ALLOW_REL_ERR = 0.10  # ±10% tolerance for duration/length checks
+ALLOW_REL_ERR = 0.10  # ±10%
 
-# Drum-track outlier filter
-MIN_NOTES_HARD = 1    # drop songs with literally zero drum notes
+# Drum-track + structure filters
+MIN_NOTES_HARD = 1        # drop if literally no drum notes
+MIN_BARS = 8              # drop very short songs (paper mentions empty/short/noisy)
+QUANT_TOL_STEPS = 1       # keep notes within ±1 step of a 16th center
 
-# Quantization: 16th-beat grid at LPD's 96 steps/bar -> every 6 steps
-SIXTEENTH_STEPS = 6
-TOL_STEPS = 1  # keep notes within ±1 step of 16th grid
+# Optional: drop if too many off-grid notes BEFORE quantization.
+# Paper does not hard-drop here; leave None to disable. Set e.g. 0.05 to be stricter.
+DROP_IF_OFFGRID_PCT_GT_DEFAULT = None  # or 0.05 to get closer to ~9.9k
 
-# Resume manifest filenames (written under data_root)
+# Resume manifests
 MANIFEST_KEPT  = "lpd_manifest_kept.txt"
 MANIFEST_TRASH = "lpd_manifest_trash.txt"
 
+
 # -------------------------
-# Small helpers & logging
+# Logging helpers
 # -------------------------
 
 def now_ts() -> str:
@@ -93,11 +92,16 @@ def log(level: str, msg: str, debug: bool = False):
     elif debug:
         print(f"{now_ts()} | {level:<5} | {msg}")
 
-def list_npz_files(root: Path) -> List[Path]:
-    return sorted(root.rglob("*.npz"))
+
+# -------------------------
+# I/O helpers
+# -------------------------
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
+
+def list_npz_files(root: Path) -> List[Path]:
+    return sorted(root.rglob("*.npz"))
 
 def append_line(path: Path, line: str):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,10 +112,9 @@ def move_to_trash(src: Path, trash_root: Path) -> Path:
     ensure_dir(trash_root)
     dest = trash_root / src.name
     if dest.exists():
-        stem, suf = src.stem, src.suffix
         i = 1
         while True:
-            cand = trash_root / f"{stem}.dup{i}{suf}"
+            cand = trash_root / f"{src.stem}.dup{i}{src.suffix}"
             if not cand.exists():
                 dest = cand
                 break
@@ -119,9 +122,64 @@ def move_to_trash(src: Path, trash_root: Path) -> Path:
     shutil.move(str(src), str(dest))
     return dest
 
+
 # -------------------------
 # NPZ <-> Multitrack utils
 # -------------------------
+
+def load_multitrack(npz_path: Path, debug: bool = False) -> ppr.Multitrack:
+    """Robust loader: try ppr.load, otherwise reconstruct from arrays."""
+    try:
+        mt = ppr.load(str(npz_path))
+        if isinstance(mt, ppr.Multitrack):
+            log("DEBUG", f"[load] {npz_path.name} via ppr.load()", debug)
+            return mt
+    except Exception as e:
+        log("DEBUG", f"[load] ppr.load failed for {npz_path.name}: {e}", debug)
+
+    try:
+        data = np.load(str(npz_path), allow_pickle=True)
+        keys = set(data.keys())
+
+        if "tracks" in keys:
+            tracks = []
+            for t in data["tracks"]:
+                pr = np.array(t["pianoroll"])
+                prog = int(t.get("program", 0))
+                is_d = bool(t.get("is_drum", False))
+                name = str(t.get("name", ""))
+                tracks.append(ppr.Track(pianoroll=pr, program=prog, is_drum=is_d, name=name))
+            beat_res = int(data.get("beat_resolution", 24))
+            tempo    = np.array(data.get("tempo")) if "tempo" in keys else None
+            downbeat = np.array(data.get("downbeat")) if "downbeat" in keys else None
+            return ppr.Multitrack(tracks=tracks, tempo=tempo, downbeat=downbeat, beat_resolution=beat_res)
+
+        if {"pianoroll", "programs", "is_drum"} <= keys:
+            pr = np.array(data["pianoroll"])
+            if pr.ndim == 2:
+                pr = pr[None, ...]
+            programs = np.array(data["programs"]).tolist()
+            is_drums = np.array(data["is_drum"]).tolist()
+            names    = data["names"].tolist() if "names" in keys else [""] * len(programs)
+            tracks = []
+            for i in range(len(programs)):
+                tracks.append(ppr.Track(pianoroll=pr[i], program=int(programs[i]),
+                                        is_drum=bool(is_drums[i]), name=str(names[i])))
+            beat_res = int(data.get("beat_resolution", 24))
+            tempo    = np.array(data.get("tempo")) if "tempo" in keys else None
+            downbeat = np.array(data.get("downbeat")) if "downbeat" in keys else None
+            return ppr.Multitrack(tracks=tracks, tempo=tempo, downbeat=downbeat, beat_resolution=beat_res)
+
+        if "multitrack" in keys:
+            obj = data["multitrack"].item() if np.ndim(data["multitrack"]) else data["multitrack"]
+            if isinstance(obj, ppr.Multitrack):
+                return obj
+
+    except Exception as e:
+        log("DEBUG", f"[load] np.load fallback failed for {npz_path.name}: {e}", debug)
+
+    raise TypeError("Unsupported NPZ layout for pypianoroll.Multitrack")
+
 
 def multitrack_max_length_steps(mt: ppr.Multitrack) -> int:
     L = 0
@@ -130,6 +188,10 @@ def multitrack_max_length_steps(mt: ppr.Multitrack) -> int:
         if pr is not None:
             L = max(L, pr.shape[0])
     return L
+
+def steps_per_16th(beat_res: int) -> int:
+    # beat_resolution is steps per quarter note. 16th = quarter/4.
+    return max(1, int(round(beat_res / 4.0)))
 
 def find_drum_track_idx(mt: ppr.Multitrack) -> Optional[int]:
     for i, tr in enumerate(mt.tracks):
@@ -143,86 +205,6 @@ def drum_note_count(mt: ppr.Multitrack, drum_idx: int) -> int:
         return 0
     return int((roll > 0).sum())
 
-def load_multitrack(npz_path: Path, debug: bool = False) -> ppr.Multitrack:
-    """
-    Robust loader:
-      1) try ppr.load(...)
-      2) fallback: reconstruct from arrays in npz (common LPD variants)
-    """
-    # 1) canonical path
-    try:
-        mt = ppr.load(str(npz_path))
-        if isinstance(mt, ppr.Multitrack):
-            log("DEBUG", f"[load] {npz_path.name} via ppr.load()", debug)
-            return mt
-    except Exception as e:
-        log("DEBUG", f"[load] ppr.load failed for {npz_path.name}: {e}", debug)
-
-    # 2) fallback reconstructions
-    try:
-        data = np.load(str(npz_path), allow_pickle=True)
-        keys = set(data.keys())
-
-        # Case A: "tracks" object array of dict-like entries
-        if "tracks" in keys:
-            tracks = []
-            for t in data["tracks"]:
-                # handle np.void, dict, etc.
-                pianoroll = np.array(t["pianoroll"])
-                program   = int(t.get("program", 0))
-                is_drum   = bool(t.get("is_drum", False))
-                name      = str(t.get("name", ""))
-                tracks.append(ppr.Track(pianoroll=pianoroll,
-                                        program=program,
-                                        is_drum=is_drum,
-                                        name=name))
-            beat_resolution = int(data.get("beat_resolution", 24))
-            tempo    = np.array(data.get("tempo")) if "tempo" in keys else None
-            downbeat = np.array(data.get("downbeat")) if "downbeat" in keys else None
-            mt = ppr.Multitrack(tracks=tracks,
-                                tempo=tempo,
-                                downbeat=downbeat,
-                                beat_resolution=beat_resolution)
-            log("DEBUG", f"[load] {npz_path.name} via fallback 'tracks'", debug)
-            return mt
-
-        # Case B: stacked arrays (programs, is_drum, pianoroll)
-        if {"pianoroll", "programs", "is_drum"} <= keys:
-            pr = np.array(data["pianoroll"])  # (T,128) or (n_tracks,T,128)
-            if pr.ndim == 2:
-                pr = pr[None, ...]
-            programs = np.array(data["programs"]).tolist()
-            is_drums = np.array(data["is_drum"]).tolist()
-            names    = data["names"].tolist() if "names" in keys else [""] * len(programs)
-            tracks = []
-            for i in range(len(programs)):
-                tracks.append(ppr.Track(
-                    pianoroll=pr[i],
-                    program=int(programs[i]),
-                    is_drum=bool(is_drums[i]),
-                    name=str(names[i])
-                ))
-            beat_resolution = int(data.get("beat_resolution", 24))
-            tempo    = np.array(data.get("tempo")) if "tempo" in keys else None
-            downbeat = np.array(data.get("downbeat")) if "downbeat" in keys else None
-            mt = ppr.Multitrack(tracks=tracks,
-                                tempo=tempo,
-                                downbeat=downbeat,
-                                beat_resolution=beat_resolution)
-            log("DEBUG", f"[load] {npz_path.name} via fallback 'stacked arrays'", debug)
-            return mt
-
-        # Case C: single pickled multitrack object
-        if "multitrack" in keys:
-            obj = data["multitrack"].item() if np.ndim(data["multitrack"]) else data["multitrack"]
-            if isinstance(obj, ppr.Multitrack):
-                log("DEBUG", f"[load] {npz_path.name} via embedded multitrack", debug)
-                return obj
-
-    except Exception as e:
-        log("DEBUG", f"[load] np.load fallback failed for {npz_path.name}: {e}", debug)
-
-    raise TypeError("Unsupported NPZ layout for pypianoroll.Multitrack")
 
 # -------------------------
 # Duration & quantization
@@ -230,7 +212,7 @@ def load_multitrack(npz_path: Path, debug: bool = False) -> ppr.Multitrack:
 
 def write_temp_midi(mt: ppr.Multitrack, tmpdir: Path) -> Path:
     midi_path = tmpdir / "temp.mid"
-    ppr.write(str(midi_path), mt)  # requires Multitrack instance
+    ppr.write(str(midi_path), mt)  # requires Multitrack object
     return midi_path
 
 def synthesize_midi_to_wav(midi_path: Path, wav_path: Path, sr: int = SR):
@@ -250,14 +232,12 @@ def audio_duration_seconds(path: Path) -> float:
         return float(len(y) / sr)
 
 def symbolic_duration_seconds(mt: ppr.Multitrack) -> float:
-    """Compute symbolic duration (seconds) from tempo array and beat_resolution."""
     T = multitrack_max_length_steps(mt)
     res = int(getattr(mt, "beat_resolution", 24))
     tempo = getattr(mt, "tempo", None)
 
     if tempo is None:
-        # assume constant 120 QPM
-        sec_per_step = 60.0 / (120.0 * res)
+        sec_per_step = 60.0 / (120.0 * res)  # assume 120 QPM
         return T * sec_per_step
 
     tempo = np.asarray(tempo).squeeze()
@@ -274,12 +254,6 @@ def symbolic_duration_seconds(mt: ppr.Multitrack) -> float:
     return float(sec_per_step.sum())
 
 def duration_consistency_ok(mt: ppr.Multitrack, mode: str = "symbolic", debug: bool = False) -> bool:
-    """
-    mode:
-      - 'none'     : always True (fastest).
-      - 'symbolic' : cheap structural check (no audio render).
-      - 'synth'    : render WAV with fluidsynth and compare seconds (slow).
-    """
     if mode == "none":
         return True
 
@@ -297,7 +271,7 @@ def duration_consistency_ok(mt: ppr.Multitrack, mode: str = "symbolic", debug: b
             log("DEBUG", f"[dur/sym] T={T} tempo_len={len(tempo)} tol={tol}", True)
         return ok
 
-    # mode == 'synth' (slow, exact seconds)
+    # 'synth' mode: render to WAV and compare seconds (slow)
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         midi = write_temp_midi(mt, td)
@@ -319,60 +293,113 @@ def duration_consistency_ok(mt: ppr.Multitrack, mode: str = "symbolic", debug: b
         log("DEBUG", f"[dur] mismatch: audio={audio_sec:.2f}s symbolic={sym_sec:.2f}s ratio={ratio:.3f}", True)
     return ok
 
-def sixteen_grid_mask(T: int) -> np.ndarray:
-    """Boolean mask: True on/near 16th grid (±TOL_STEPS), assuming 96 steps per bar."""
-    g = np.zeros(T, dtype=bool)
-    for t in range(T):
-        r = t % SIXTEENTH_STEPS
-        if r <= TOL_STEPS or r >= SIXTEENTH_STEPS - TOL_STEPS:
-            g[t] = True
-    return g
+def offgrid_percentage(roll: np.ndarray, res: int, tol_steps: int) -> float:
+    """Compute percentage of active frames that are not within ±tol of a 16th center."""
+    T = roll.shape[0]
+    if T == 0:
+        return 0.0
+    s16 = steps_per_16th(res)
+    on = np.zeros(T, dtype=bool)
+    # mark centers ± tol
+    for c in range(0, T, s16):
+        lo = max(0, c - tol_steps)
+        hi = min(T, c + tol_steps + 1)
+        on[lo:hi] = True
+    active = (roll > 0)
+    total = int(active.sum())
+    if total == 0:
+        return 0.0
+    off = int(active[~on].sum())
+    return off / total
 
-def quantize_drum_track_inplace(mt: ppr.Multitrack, drum_idx: int) -> Tuple[int, int]:
+def quantize_drum_track_inplace(mt: ppr.Multitrack, drum_idx: int, tol_steps: int = QUANT_TOL_STEPS) -> Tuple[int, int, float]:
     """
-    Keep only notes at time-steps near the 16th grid; zero the rest.
-    Returns (kept_notes, removed_notes).
+    Snap notes to nearest 16th center within ±tol; remove notes outside that window.
+    Implementation: for each 16th center, take max over the local window, write it at the center,
+    zero the window elsewhere. Returns (kept_notes, removed_notes, removed_pct).
     """
+    res = int(getattr(mt, "beat_resolution", 24))
+    s16 = steps_per_16th(res)
     roll = mt.tracks[drum_idx].pianoroll
     T = roll.shape[0]
-    on_near_grid = sixteen_grid_mask(T)
 
     cur = roll > 0
     total_notes = int(cur.sum())
+    if total_notes == 0:
+        return 0, 0, 0.0
 
-    off_idx = ~on_near_grid
-    removed_notes = int(cur[off_idx].sum())
-    roll[off_idx, :] = 0
+    removed_notes = 0
+    # Work on a copy to avoid interfering while sweeping windows
+    out = np.zeros_like(roll, dtype=roll.dtype)
 
-    kept_notes = total_notes - removed_notes
-    return kept_notes, removed_notes
+    for c in range(0, T, s16):
+        lo = max(0, c - tol_steps)
+        hi = min(T, c + tol_steps + 1)
+        window = roll[lo:hi]  # (win, 128)
+        if window.size == 0:
+            continue
+        grid_val = (window > 0).max(axis=0).astype(roll.dtype)
+        out[c, :] = np.maximum(out[c, :], grid_val)
+
+    kept_notes = int((out > 0).sum())
+    removed_notes = total_notes - kept_notes
+    mt.tracks[drum_idx].pianoroll = out
+    removed_pct = 0.0 if total_notes == 0 else removed_notes / total_notes
+    return kept_notes, removed_notes, removed_pct
+
 
 # -------------------------
-# Pass 0: parallel drum counts
+# PASS 1 (parallel): duration, bars, drum presence, counts
 # -------------------------
 
-def pass0_one(p: Path) -> Dict:
+def pass1_one(args) -> Dict:
+    p, duration_check, min_bars, tol_steps, debug = args
     try:
         mt = load_multitrack(p, debug=False)
+        res = int(getattr(mt, "beat_resolution", 24))
+        T = multitrack_max_length_steps(mt)
+        bars = int(round(T / float(res * 4)))
+
         di = find_drum_track_idx(mt)
         if di is None:
-            return {"path": p, "has_drum": False, "drum_notes": 0}
-        return {"path": p, "has_drum": True, "drum_notes": drum_note_count(mt, di)}
-    except Exception as e:
-        return {"path": p, "has_drum": False, "drum_notes": 0, "error": str(e)}
+            return {"path": p, "status": "no_drum"}
 
-def pass0_collect_counts(npz_files: List[Path], workers: int = 8) -> List[Dict]:
+        roll = mt.tracks[di].pianoroll
+        if roll is None or roll.size == 0 or (roll > 0).sum() < MIN_NOTES_HARD:
+            return {"path": p, "status": "empty_drum"}
+
+        if bars < min_bars:
+            return {"path": p, "status": "too_short", "bars": bars}
+
+        if not duration_consistency_ok(mt, mode=duration_check, debug=debug):
+            return {"path": p, "status": "bad_duration"}
+
+        # compute drum counts + off-grid%
+        drum_cnt = drum_note_count(mt, di)
+        og_pct = offgrid_percentage(roll, res, tol_steps)
+        return {"path": p, "status": "ok", "drum_notes": drum_cnt, "offgrid_pct": og_pct, "bars": bars}
+
+    except Exception as e:
+        return {"path": p, "status": "error", "error": str(e)}
+
+def pass1_collect(npz_files: List[Path], duration_check: str, min_bars: int,
+                  tol_steps: int, workers: int, debug: bool) -> List[Dict]:
+    args = [(p, duration_check, min_bars, tol_steps, debug) for p in npz_files]
     if workers <= 1:
         out = []
-        for p in tqdm(npz_files, desc="[scan] npz", unit="file"):
-            out.append(pass0_one(p))
+        for a in tqdm(args, desc="[pass1] scan", unit="file"):
+            out.append(pass1_one(a))
         return out
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        return list(tqdm(ex.map(pass0_one, npz_files),
-                         total=len(npz_files), desc="[scan] npz", unit="file"))
+        return list(tqdm(ex.map(pass1_one, args),
+                         total=len(args), desc="[pass1] scan", unit="file"))
+
+
+# -------------------------
+# Stats & pipeline
+# -------------------------
 
 def compute_outlier_thresholds(counts: List[int]) -> Tuple[float, float, float, float]:
-    """Returns (mean, std, low, high) where low=mean-2*std, high=mean+2*std."""
     if len(counts) == 0:
         return 0.0, 0.0, -math.inf, math.inf
     arr = np.asarray(counts, dtype=float)
@@ -382,9 +409,6 @@ def compute_outlier_thresholds(counts: List[int]) -> Tuple[float, float, float, 
     hi = mu + 2.0 * sd
     return mu, sd, lo, hi
 
-# -------------------------
-# Cleaning pipeline
-# -------------------------
 
 def clean_dataset(
     data_root: Path,
@@ -396,13 +420,17 @@ def clean_dataset(
     write_clean: bool = False,
     resume: bool = True,
     debug: bool = False,
+    min_bars: int = MIN_BARS,
+    drop_if_offgrid_pct_gt: Optional[float] = DROP_IF_OFFGRID_PCT_GT_DEFAULT,
+    quant_tol_steps: int = QUANT_TOL_STEPS,
 ):
     log("INFO",  f"[paths] DATA_ROOT={data_root}")
     log("INFO",  f"[paths] LPD_DIR={lpd_dir}")
     log("INFO",  f"[paths] TRASH_DIR={trash_dir}")
     log("INFO",  f"[conf ] duration_check={duration_check}  workers={workers}  write_clean={int(write_clean)}  resume={int(resume)}")
+    log("INFO",  f"[conf ] min_bars={min_bars}  drop_if_offgrid_pct_gt={drop_if_offgrid_pct_gt}  quant_tol_steps={quant_tol_steps}")
     if duration_check == "synth" and not SOUND_FONT.exists():
-        log("WARN", f"SoundFont not found at {SOUND_FONT}. 'synth' duration check will fail.",)
+        log("WARN", f"SoundFont not found at {SOUND_FONT}. 'synth' check will fail.")
 
     ensure_dir(trash_dir)
 
@@ -420,105 +448,93 @@ def clean_dataset(
         log("INFO", f"[info] skipping {len(done)} already decided files (kept={len(done_kept)}, trash={len(done_trash)})")
         log("INFO", f"[info] scanning remaining {len(all_npz)} files")
 
-    # ---- PASS 0: drum-note counts in parallel ----
-    meta = pass0_collect_counts(all_npz, workers=workers)
-    counts = [m["drum_notes"] for m in meta if m.get("has_drum") and m["drum_notes"] >= MIN_NOTES_HARD]
-    mu, sd, lo, hi = compute_outlier_thresholds(counts)
-    log("INFO", f"[stats] drum-note count: mean={mu:.1f} std={sd:.1f}  keep-range=[{max(lo,0):.1f}, {hi:.1f}]")
+    # ---- PASS 1: check duration/bars/drums; collect counts & off-grid ----
+    p1 = pass1_collect(all_npz, duration_check, min_bars, quant_tol_steps, workers, debug)
 
-    # First, immediately trash the obvious rejects (no/empty drum or out-of-range)
+    # Candidates = survivors of Step 1 (paper order)
+    candidates = [m for m in p1 if m.get("status") == "ok"]
+    # Compute stats for Step 2 only on candidates
+    counts = [m["drum_notes"] for m in candidates if m["drum_notes"] >= MIN_NOTES_HARD]
+    mu, sd, lo, hi = compute_outlier_thresholds(counts)
+    log("INFO", f"[stats] drum-note (post-step1): mean={mu:.1f} std={sd:.1f} keep=[{max(lo,0):.1f},{hi:.1f}]")
+    log("INFO", f"[filter] step1 candidates: {len(candidates)} / scanned {len(p1)}")
+
     kept_stems = 0
     trashed_stems = 0
 
-    candidates: List[Dict] = []
-    for m in meta:
-        p = m["path"]
-        stem = p.stem
+    # Apply Step 2 (mean±2σ) and optional off-grid% drop
+    survivors = []
+    for m in candidates:
+        p = m["path"]; stem = p.stem
+        dn = m["drum_notes"]; og = m["offgrid_pct"]
 
-        # Rule A: must have a drum track with >= MIN_NOTES_HARD notes
-        if not m.get("has_drum") or m["drum_notes"] < MIN_NOTES_HARD:
-            log("INFO", f"[drop] {p.name} (no/empty drum track)")
+        if not (lo <= dn <= hi):
+            log("INFO", f"[drop] {p.name} (drum notes={dn} out of [{lo:.1f},{hi:.1f}])")
             if not dry_run:
-                move_to_trash(p, trash_dir)
-                append_line(trash_file, stem)
+                move_to_trash(p, trash_dir); append_line(trash_file, stem)
             trashed_stems += 1
             continue
 
-        # Rule B: within mean±2*std
-        if not (lo <= m["drum_notes"] <= hi):
-            log("INFO", f"[drop] {p.name} (drum notes={m['drum_notes']} out of [{lo:.1f},{hi:.1f}])")
+        if drop_if_offgrid_pct_gt is not None and og > float(drop_if_offgrid_pct_gt):
+            log("INFO", f"[drop] {p.name} (off-grid {og*100:.2f}% > {float(drop_if_offgrid_pct_gt)*100:.2f}%)")
             if not dry_run:
-                move_to_trash(p, trash_dir)
-                append_line(trash_file, stem)
+                move_to_trash(p, trash_dir); append_line(trash_file, stem)
             trashed_stems += 1
             continue
 
-        candidates.append(m)
+        survivors.append(m)
 
-    log("INFO", f"[filter] drum-count candidates: {len(candidates)} / {len(meta)}")
+    log("INFO", f"[filter] step2 survivors: {len(survivors)}")
 
-    # Now apply (1) duration consistency and (3) 16th quantization on survivors
-    for m in tqdm(candidates, desc="[clean] files", unit="file"):
-        p = m["path"]
-        stem = p.stem
-
+    # Step 3: quantize (modify notes), and optionally write clean copies
+    for m in tqdm(survivors, desc="[quantize] drum tracks", unit="file"):
+        p = m["path"]; stem = p.stem
         try:
             mt = load_multitrack(p, debug=debug)
             di = find_drum_track_idx(mt)
             if di is None:
-                log("INFO", f"[drop] {p.name} (no/empty drum track)")
+                # should not happen (already filtered), but be safe
+                log("INFO", f"[drop] {p.name} (lost drum track?)")
                 if not dry_run:
-                    move_to_trash(p, trash_dir)
-                    append_line(trash_file, stem)
+                    move_to_trash(p, trash_dir); append_line(trash_file, stem)
                 trashed_stems += 1
                 continue
 
-            if not duration_consistency_ok(mt, mode=duration_check, debug=debug):
-                log("INFO", f"[drop] {p.name} (inconsistent duration)")
-                if not dry_run:
-                    move_to_trash(p, trash_dir)
-                    append_line(trash_file, stem)
-                trashed_stems += 1
-                continue
+            kept, removed, removed_pct = quantize_drum_track_inplace(mt, di, tol_steps=quant_tol_steps)
+            log("DEBUG", f"[quant] {p.name}: kept={kept} removed={removed} ({removed_pct*100:.2f}%)", debug)
 
-            kept_notes, removed_notes = quantize_drum_track_inplace(mt, di)
-            total = kept_notes + removed_notes
-            removed_pct = (100.0 * removed_notes / max(1, total))
-            log("DEBUG", f"[quant] {p.name}: kept={kept_notes} removed={removed_notes} ({removed_pct:.2f}%)", debug)
-
-            if not dry_run and write_clean:
-                out_clean = p.with_suffix("").with_name(p.stem + ".clean.npz")
-                try:
-                    ppr.save(str(out_clean), mt)  # pypianoroll >= 1.0
-                except Exception:
-                    # fallback: pack the essentials in a compatible layout
-                    np.savez_compressed(
-                        str(out_clean),
-                        tracks=[tr.pianoroll for tr in mt.tracks],
-                        tempo=mt.tempo,
-                        beat_resolution=getattr(mt, "beat_resolution", 24),
-                        downbeat=getattr(mt, "downbeat", None),
-                        programs=[tr.program for tr in mt.tracks],
-                        is_drum=[tr.is_drum for tr in mt.tracks],
-                        names=[getattr(tr, "name", "") for tr in mt.tracks],
-                    )
-
-            kept_stems += 1
             if not dry_run:
+                # Mark kept
                 append_line(kept_file, stem)
+                # Optionally write a quantized copy
+                if write_clean:
+                    out_clean = p.with_suffix("").with_name(p.stem + ".clean.npz")
+                    try:
+                        ppr.save(str(out_clean), mt)
+                    except Exception:
+                        np.savez_compressed(
+                            str(out_clean),
+                            tracks=[tr.pianoroll for tr in mt.tracks],
+                            tempo=mt.tempo,
+                            beat_resolution=getattr(mt, "beat_resolution", 24),
+                            downbeat=getattr(mt, "downbeat", None),
+                            programs=[tr.program for tr in mt.tracks],
+                            is_drum=[tr.is_drum for tr in mt.tracks],
+                            names=[getattr(tr, "name", "") for tr in mt.tracks],
+                        )
+            kept_stems += 1
 
         except Exception as e:
-            log("ERROR", f"[clean] {p.name}: {e}")
+            log("ERROR", f"[quant] {p.name}: {e}")
             if not dry_run:
                 try:
-                    move_to_trash(p, trash_dir)
-                    append_line(trash_file, stem)
+                    move_to_trash(p, trash_dir); append_line(trash_file, stem)
                 except Exception:
                     pass
             trashed_stems += 1
 
-    # Also count the already-done items to give a full summary
-    total_all = len(all_npz_all)
+    # Totals incl. already-done stems
+    total_all = len(list_npz_files(lpd_dir))
     kept_total  = kept_stems + len(done_kept)
     trash_total = trashed_stems + len(done_trash)
 
@@ -526,6 +542,7 @@ def clean_dataset(
     log("INFO", f"[summary] kept (this run / total): {kept_stems} / {kept_total}")
     log("INFO", f"[summary] trashed (this run / total): {trashed_stems} / {trash_total}")
     log("INFO", f"[summary] total npz observed: {total_all}")
+
 
 # -------------------------
 # CLI
@@ -536,25 +553,31 @@ def parse_bool(x: str) -> bool:
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Clean LPD dataset per Wei et al. (2019).")
+    ap = argparse.ArgumentParser(description="Clean LPD dataset (Wei et al., 2019).")
     ap.add_argument("--data_root", type=str, default=DEFAULT_DATA_ROOT,
-                    help="Root directory containing 'lpd/' and where manifests will be written.")
+                    help="Root that contains 'lpd/' and where manifests will be written.")
     ap.add_argument("--lpd_subdir", type=str, default=LPD_SUBDIR,
-                    help="Relative subfolder under data_root containing .npz files")
+                    help="Relative subfolder under data_root containing .npz files.")
     ap.add_argument("--trash_subdir", type=str, default=TRASH_SUBDIR,
-                    help="Relative subfolder under data_root for trashed files")
+                    help="Relative subfolder under data_root for trashed files.")
     ap.add_argument("--dry_run", type=parse_bool, default=False,
-                    help="If True, skip file moves/writes; just log decisions.")
+                    help="If True, log decisions but do not move/write files.")
     ap.add_argument("--duration_check", choices=["synth", "symbolic", "none"], default="symbolic",
-                    help="How to verify duration consistency (synth is slow; symbolic is fast; none skips).")
+                    help="Duration consistency mode (synth is slow; symbolic is fast).")
     ap.add_argument("--workers", type=int, default=8,
-                    help="Parallel workers for the initial scan (drum note counting).")
+                    help="Parallel workers for Pass 1.")
     ap.add_argument("--write_clean", type=parse_bool, default=False,
-                    help="If True, write '<stem>.clean.npz' next to kept originals.")
+                    help="If True, write '<stem>.clean.npz' quantized copies next to originals.")
     ap.add_argument("--resume", type=parse_bool, default=True,
-                    help="If True, skip stems that already appear in kept/trash manifests.")
+                    help="If True, skip stems already listed in kept/trash manifests.")
     ap.add_argument("--debug", type=parse_bool, default=False,
-                    help="Verbose debug logs (loader path, quantization stats, etc.).")
+                    help="Verbose debug logs.")
+    ap.add_argument("--min_bars", type=int, default=MIN_BARS,
+                    help="Minimum bars required to keep a song (before outlier step).")
+    ap.add_argument("--drop_if_offgrid_pct_gt", type=float, default=DROP_IF_OFFGRID_PCT_GT_DEFAULT if DROP_IF_OFFGRID_PCT_GT_DEFAULT is not None else -1.0,
+                    help="Optional: drop if off-grid%% > threshold (e.g., 0.05). Use negative to disable.")
+    ap.add_argument("--quant_tol_steps", type=int, default=QUANT_TOL_STEPS,
+                    help="±steps around 16th center kept during quantization.")
 
     args = ap.parse_args()
 
@@ -566,6 +589,8 @@ def main():
         log("ERROR", f"LPD directory not found: {lpd_dir}")
         sys.exit(1)
 
+    drop_thresh = None if args.drop_if_offgrid_pct_gt is None or args.drop_if_offgrid_pct_gt < 0 else float(args.drop_if_offgrid_pct_gt)
+
     clean_dataset(
         data_root=data_root,
         lpd_dir=lpd_dir,
@@ -576,6 +601,9 @@ def main():
         write_clean=bool(args.write_clean),
         resume=bool(args.resume),
         debug=bool(args.debug),
+        min_bars=int(args.min_bars),
+        drop_if_offgrid_pct_gt=drop_thresh,
+        quant_tol_steps=int(args.quant_tol_steps),
     )
 
 if __name__ == "__main__":
