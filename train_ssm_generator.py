@@ -213,6 +213,24 @@ def atomic_pickle_dump(obj, dst: Path):
         os.fsync(f.fileno())
     os.replace(tmp, dst)
 
+def atomic_npy_dump(arr: np.ndarray, dst: Path):
+    ensure_dir(dst)
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    with open(tmp, "wb") as f:
+        np.save(f, arr, allow_pickle=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, dst)
+
+def atomic_npz_dump(dst: Path, **arrays):
+    ensure_dir(dst)
+    tmp = dst.with_name(f".{dst.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    with np.savez_compressed(tmp, **arrays) as _:
+        pass  # context closes file
+    # On some NumPy builds you can’t fsync within the context; do a second open if you want fsync:
+    with open(tmp, "rb+") as f:
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, dst)
 
 def drum_onset_count_from_npz(npz_path: Path) -> Optional[int]:
     """
@@ -333,6 +351,10 @@ def assert_mt_ok(mt, tag):
         f"tempo must be 1D len T, got {None if t is None else t.shape}"
     assert isinstance(db, np.ndarray) and db.ndim == 1 and db.shape[0] == T, \
         f"downbeat must be 1D len T, got {None if db is None else db.shape}"
+
+def _unwrap(m):
+    return m.module if isinstance(m, nn.DataParallel) else m
+
 
 # -------------------------
 # LPD loading & bar slicing (Pypianoroll)
@@ -884,10 +906,12 @@ def prepare_one_song(npz_path: Path, only_cache_cqt: bool = False):
         B = int(bars_cqt.shape[0])
 
         # ------- Save cache atomically -------
-        OUT_CQT_POOL.mkdir(parents=True, exist_ok=True)
-        tmp = cqt_npy.with_suffix(".tmp.npy")
-        np.save(tmp, bars_cqt)
-        os.replace(tmp, cqt_npy)
+        # OUT_CQT_POOL.mkdir(parents=True, exist_ok=True)
+        # tmp = cqt_npy.with_suffix(".tmp.npy")
+        # np.save(tmp, bars_cqt)
+        # os.replace(tmp, cqt_npy)
+        # ------- Save cache atomically -------
+        atomic_npy_dump(bars_cqt, cqt_npy)
 
         # Optional cleanup if you created temp files
         if not KEEP_MIDI and midi_nd is not None: safe_unlink(midi_nd)
@@ -1001,7 +1025,7 @@ def prepare_dataset(limit=None, cache_limit = None):
     # print("[dbg] first_10_npz =", list_npz_files(DATASET_ROOT)[:10]) #checking: list firrst few npz files found under DATASET_ROOT & print total count
     #finds all npz files
     npz_files = list_npz_files(DATASET_ROOT)
-    
+     
     # ---- skip stems that already have both pickles ----
     have_mel   = {p.stem.replace("song_barlv_ssm_", "") for p in OUT_MEL_SSM.glob("*.pkl")}
     have_drm   = {p.stem.replace("song_barlv_drum_ssm_", "") for p in OUT_DRUM_SSM.glob("*.pkl")}
@@ -1076,8 +1100,8 @@ def prepare_dataset(limit=None, cache_limit = None):
         pbar.close()
 
     # ---------- PASS B: cache-only backfill ----------
-    MAX_CACHE = 20
-    need_cache = need_cache[:MAX_CACHE]
+    # MAX_CACHE = 20
+    # need_cache = need_cache[:MAX_CACHE]
     if need_cache:
         pbar = tqdm(need_cache, desc="[cache] backfill CQT", unit="song", dynamic_ncols=True)
         for p in pbar:
@@ -1300,6 +1324,12 @@ def train_ssm(limit=None, cache_limit=None):
     dec = SSMDecoder(out_channels=1, base_channels=64, latent_dim=32)
     vae = SSMVAE(enc, dec).to(DEVICE)
     dis = SSMDiscriminator(in_channels=1, base_channels=64).to(DEVICE)
+
+
+    # NEW: using all visible GPUs
+    if DEVICE.type == "cuda" and torch.cuda.device_count() > 1:
+        vae = nn.DataParallel(vae)
+        dis = nn.DataParallel(dis)
 
     #create adam optimizers for VAE and 
     optG = torch.optim.Adam(vae.parameters(), lr=LR_GEN, betas=(BETA1, BETA2))
@@ -1554,20 +1584,19 @@ def train_ssm(limit=None, cache_limit=None):
             best_val = current_valG
             torch.save({
                 "epoch": epoch,
-                "vae": vae.state_dict(),
-                "dis": dis.state_dict(),
+                "vae": _unwrap(vae).state_dict(),
+                "dis": _unwrap(dis).state_dict(),
                 "optG": optG.state_dict(),
                 "optD": optD.state_dict(),
                 "val": best_val
             }, CKPT_DIR / "best.pt")
-            print("  ✓ Saved best checkpoint.")
     
     
     #save final weights at end of training, regardless of whether last epoch was best or not
     torch.save({
         "epoch": NUM_EPOCHS,
-        "vae": vae.state_dict(),
-        "dis": dis.state_dict(),
+        "vae": _unwrap(vae).state_dict(),
+        "dis": _unwrap(dis).state_dict(),
         "optG": optG.state_dict(),
         "optD": optD.state_dict()
     }, CKPT_DIR / "last.pt")
