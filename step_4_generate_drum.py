@@ -10,7 +10,7 @@ from models import DrumVAE, DrumEncoder, DrumDecoder
 from utils import (
     load_bar_index_list,
     read_bar_feature_package,
-    save_midi_from_drum_pattern,
+    
     evaluate_note_score,
     downsample_256x256_to_46x16,
 )
@@ -19,8 +19,8 @@ from utils import (
 # CONFIGURATION
 # ---------------------------------------------
 data_root = "/data/pre_processed_data"
-out_root = "./generated_data"
-ckpt_path = "./checkpoints/drum_generator/best.pt"
+out_root = "/data/generated_data"
+ckpt_path = "./checkpoints/drum_generator/best_train.pt"
 
 add_note_levels = [0, 3, 6, 12, 20]
 batch_size = 64
@@ -50,7 +50,7 @@ def run_generation(device=None):
     for add_note_val in add_note_levels:
         print(f"[info] Generating with +{add_note_val} note complexity")
         
-        all_inputs, all_targets, all_outputs = [], [], []
+        all_inputs, all_targets, all_outputs, all_indices = [], [], [], []
 
         for idx_str in tqdm(bar_idx_list):
             # Load per-bar conditioning features
@@ -79,10 +79,13 @@ def run_generation(device=None):
             all_inputs.append(cqt_tensor.squeeze(0).cpu().numpy())
             all_targets.append(target_drum)
             all_outputs.append(pred_bin)
+            all_indices.append(idx_str)
 
         # Save .mid
         out_mid_path = os.path.join(out_dir, f"drums_addnote_{add_note_val}.mid")
-        save_midi_from_drum_pattern(np.array(all_outputs), out_mid_path)
+        out_npz_path = os.path.join(out_root, "generated_drum_patterns.npz")
+        np.savez_compressed(out_npz_path, all_out=np.array(all_outputs), all_tar=np.array(all_targets), all_idx=np.array(all_indices))
+        print(f"[write] Saved predictions to {out_npz_path}")
 
         preds = np.array(all_outputs)
         targets = np.array(all_targets)

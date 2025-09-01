@@ -70,23 +70,23 @@ N_INSTR = len(DRUM_KEEP_PITCHES)  # 46
 # Model / training
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # BATCH_SIZE = 64
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 NUM_EPOCHS = 20
-LR = 1e-4
-BETA1, BETA2 = 0.5, 0.999
+LR = 2e-4
+BETA1, BETA2 = 0.9, 0.999
 LAMBDA_REC = 1.0
 LAMBDA_KL  = 1.0
 LAMBDA_C   = 1.0  # weight for note density loss
 
-EARLY_STOP_PATIENCE = 10   # optional early stopping
-MIN_EPOCHS = 5
+EARLY_STOP_PATIENCE = 6   # optional early stopping
+MIN_EPOCHS = 4
 
 # -------- dataset size controls (globals) --------
 BAR_SUBSAMPLE = 16          # keep every Nth bar (1 = keep all)
 MAX_BARS_PER_SONG = 64      # cap bars per song (0 = no cap)
-MAX_STEPS_PER_EPOCH = 250   # 0 disables the cap
-MAX_VAL_STEPS = MAX_STEPS_PER_EPOCH   # cap validation batches per epoch (0 = no cap)
-VALIDATE_EVERY = 1     # run validation every N epochs (set to 2–5 to validate less often)
+MAX_STEPS_PER_EPOCH = 150   # 0 disables the cap
+MAX_VAL_STEPS = 50   # cap validation batches per epoch (0 = no cap)
+VALIDATE_EVERY = 2     # run validation every N epochs (set to 2–5 to validate less often)
 
 # -------------------------
 # Small utilities
@@ -353,6 +353,23 @@ def _build_index(self):
         for b in bar_ids:
             self.index.append((si, b))
 
+def ensure_b1hw(x: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure tensor is (B, 1, H, W).
+    - If (B, H, W) -> unsqueeze channel.
+    - If (B, 1, H, W) -> pass through.
+    - If (B, C, H, W) and C>1 -> keep first channel (or change to mean if you prefer).
+    """
+    if x.dim() == 3:
+        return x.unsqueeze(1)
+    if x.dim() == 4:
+        if x.size(1) == 1:
+            return x
+        return x[:, :1]  # or x.mean(dim=1, keepdim=True)
+    if x.dim() == 2:  # very defensive
+        return x.unsqueeze(0).unsqueeze(0)
+    raise ValueError(f"Unexpected image tensor shape: {tuple(x.shape)}")
+
 # -------------------------
 # Dataset
 # -------------------------
@@ -573,11 +590,13 @@ class DrumGenDataset(Dataset):
         bar_t = torch.from_numpy(bar_46x16[None, ...])         # (1, 46, 16)
         # Yimg  = upsample_46x16_to_256x256(bar_t).numpy().astype(np.float32)  # (1, 256, 256)
         # Yimg = bar_t.numpy().astype(np.float32) # Keep it as (1, 46, 16)
-        Yimg = bar_t
-        Yimg = F.interpolate(Yimg.unsqueeze(0), size=(256, 256), mode='nearest').squeeze(0)
-
-
-        return torch.from_numpy(X), Yimg , torch.from_numpy(c)
+        # Yimg = bar_t
+        # Yimg  = upsample_46x16_to_256x256(bar_t).numpy().astype(np.float32)  # (1,256,256)
+        # Yimg = F.interpolate(Yimg.unsqueeze(0), size=(256, 256), mode='nearest').squeeze(0)
+        Yimg  = upsample_46x16_to_256x256(bar_t).numpy().astype(np.float32)  # (1,256,256)
+        return torch.from_numpy(X), torch.from_numpy(Yimg), torch.from_numpy(c)
+    
+        # return torch.from_numpy(X), Yimg , torch.from_numpy(c)
 
 # -------------------------
 # Training helpers
@@ -607,6 +626,12 @@ def _ensure_nchw(x: torch.Tensor) -> torch.Tensor:
     if x.dim() == 3:    # (B, H, W)
         x = x.unsqueeze(1)
     return x
+
+def kl_weight(epoch, step, steps_per_epoch, max_beta=0.05, warmup_epochs=5):
+    t = epoch * steps_per_epoch + step
+    T = max(1, warmup_epochs * steps_per_epoch)
+    w = min(1.0, t / T)
+    return max_beta * w
 
 # -------------------------
 # Main training
@@ -649,7 +674,10 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
 
     # Opt & losses
     opt = torch.optim.Adam(vae.parameters(), lr=LR, betas=(BETA1, BETA2))
-    bce = nn.BCELoss()  # decoder ends with Sigmoid in your models.py
+    bce = nn.BCEWithLogitsLoss()  # decoder ends with Sigmoid in your models.py
+    scaler = GradScaler(enabled=(DEVICE.type == "cuda"))
+    USE_AMP = (DEVICE.type == "cuda" and torch.cuda.is_available())
+    print(f"[amp] enabled={scaler.is_enabled()}")
 
     torch.backends.cudnn.benchmark = True      # pick fastest conv algos
     vae = vae.to(memory_format=torch.channels_last)
@@ -673,8 +701,11 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
     # Train
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
+    best_tr  = float("inf") 
     no_improve = 0
     epochs_range = range(1, NUM_EPOCHS+1)
+
+    
 
     pbar_epochs = tqdm(epochs_range, desc="[epochs]", unit="ep")
     for epoch in pbar_epochs:
@@ -689,24 +720,42 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
 
         for X, Yimg, c in pbar:
             nb += 1
-            X = X.to(DEVICE, non_blocking=True)              # (B,8,84,96)
-            Yimg = Yimg.to(DEVICE, non_blocking=True)        # (B,1,256,256)
-            c = c.to(DEVICE, non_blocking=True)              # (B,1)
+            X = X.to(DEVICE, non_blocking=True)       # (B,8,84,96)
+            Yimg = Yimg.to(DEVICE, non_blocking=True) # (B,1,256,256)
+            c = c.to(DEVICE, non_blocking=True)       # (B,1)
+
+            # dtype/shape for losses
+            Yimg = Yimg.float()
+            Yimg_s = Yimg.squeeze(1)                  # (B,256,256)
+            c = c.float()
+
+            # <<< Define beta BEFORE the with-block so it always exists >>>
+            beta = kl_weight(epoch, nb-1, steps_per_epoch=len(pbar), max_beta=0.05, warmup_epochs=5)
 
             opt.zero_grad(set_to_none=True)
-            recon, mu, logvar, c_hat = vae(X)                # recon (B,1,256,256)
-            print("recon.shape:", recon.shape)
-            recon = _ensure_nchw(recon)
-            Yimg  = _ensure_nchw(Yimg)
-            loss_rec = bce(recon, Yimg)
-            loss_kl  = kl_divergence(mu, logvar)
-            loss_c   = F.l1_loss(c_hat.view_as(c), c)
-            loss = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_C*loss_c
-            if not torch.isfinite(loss):   # safety
-                continue
-            opt.step() if False else None  # (leave your backward/step here unchanged)
-            # ^ keep your existing loss.backward() and opt.step() exactly as before
 
+            # Use the new autocast API (silences the deprecation warning)
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=USE_AMP):
+                recon, mu, logvar, c_hat = vae(X)     # recon (B,1,256,256)
+                recon = ensure_b1hw(recon)
+                Yimg  = ensure_b1hw(Yimg_s)
+                loss_rec = bce(recon, Yimg)
+                loss_kl  = kl_divergence(mu, logvar)
+                loss_c   = F.l1_loss(c_hat.view_as(c), c)
+                loss = LAMBDA_REC*loss_rec + beta*loss_kl + LAMBDA_C*loss_c
+
+            # Safety: skip NaNs/Infs
+            if not torch.isfinite(loss):
+                continue
+
+            # AMP backward + step + (optional) clipping
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
+            scaler.step(opt)
+            scaler.update()
+
+            # logging
             sums["loss"] += loss.item()
             sums["rec"]  += loss_rec.item()
             sums["kl"]   += loss_kl.item()
@@ -715,14 +764,20 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
             pbar.set_postfix(loss=f"{sums['loss']/nb:.3f}",
                             rec=f"{sums['rec']/nb:.3f}",
                             kl=f"{sums['kl']/nb:.3f}",
-                            c=f"{sums['c']/nb:.3f}")
+                            c=f"{sums['c']/nb:.3f}",
+                            beta=f"{beta:.3f}")
 
             # ---- hard cap steps per epoch ----
             if MAX_STEPS_PER_EPOCH and nb >= MAX_STEPS_PER_EPOCH:
-                break
-        
+                break        
         tr_loss = sums["loss"]/max(1, nb)
         save_checkpoint(CKPT_DIR / "last_tr.pt", epoch, vae, opt, tr_loss)
+
+        # NEW: best TRAIN checkpoint
+        if tr_loss < best_tr:
+            best_tr = tr_loss
+            save_checkpoint(CKPT_DIR / "best_train.pt", epoch, vae, opt, tr_loss)
+            print(f"  ✓ Saved best TRAIN checkpoint. epoch={epoch} tr_loss={tr_loss:.4f}")
 
         # Validation
         # -------------------- Validation --------------------
@@ -740,14 +795,14 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
                     Yimg = Yimg.to(DEVICE, non_blocking=True)
                     c    = c.to(DEVICE, non_blocking=True)
 
-                    recon, mu, logvar, c_hat = vae(X)
-                    # Add this if recon.shape == (B, 1, H, W)
-                    recon = _ensure_nchw(recon)
-                    Yimg  = _ensure_nchw(Yimg)
-                    loss_rec = bce(recon, Yimg)
-                    loss_kl  = kl_divergence(mu, logvar)
-                    loss_c   = F.l1_loss(c_hat.view_as(c), c)
-                    loss     = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_C*loss_c
+                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=USE_AMP):
+                        recon, mu, logvar, c_hat = vae(X)
+                        recon = ensure_b1hw(recon)
+                        Yimg  = ensure_b1hw(Yimg)
+                        loss_rec = bce(recon, Yimg)
+                        loss_kl  = kl_divergence(mu, logvar)
+                        loss_c   = F.l1_loss(c_hat.view_as(c), c)
+                        loss     = LAMBDA_REC*loss_rec + LAMBDA_KL*loss_kl + LAMBDA_C*loss_c
 
                     val_sums["loss"] += loss.item()
                     val_sums["rec"]  += loss_rec.item()
@@ -785,6 +840,7 @@ def train_drum(limit=None, epochs=None, batch_size=None, device=None, out_root=N
             if va_loss < best_val:
                 best_val = va_loss
                 no_improve = 0
+                save_checkpoint(CKPT_DIR / "best_val.pt", epoch, vae, opt, best_val)
                 save_checkpoint(CKPT_DIR / "best.pt", epoch, vae, opt, best_val)
                 print("  ✓ Saved best checkpoint.")
             else:
